@@ -11,7 +11,6 @@ import torch.backends.cuda
 import tempfile
 import unittest
 import warnings
-import pickle
 import types
 import textwrap
 from torch.utils.dlpack import from_dlpack, to_dlpack
