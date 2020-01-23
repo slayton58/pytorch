@@ -30,7 +30,9 @@ void RRefContext::handleException(
     const c10::optional<utils::FutureError>& futErr) {
   if (futErr) {
     // TODO: allow users to register an error handler and call it here.
-    VLOG(1) << "Got exception: " << (*futErr).what();
+    LOG(ERROR) << "Got exception: " << (*futErr).what();
+    std::cout << "Got exception: " << (*futErr).what() << std::endl;
+    std::cerr << "Got exception: " << (*futErr).what() << std::endl;
     throw std::runtime_error((*futErr).what());
   }
 }
@@ -153,6 +155,7 @@ void RRefContext::delUser(
 }
 
 void RRefContext::delAllUsers() {
+  LOG(ERROR) << getWorkerName() << ": Entering delAllUsers()";
   for (const auto& user : confirmedUsers_) {
     auto rref_ptr = user.second.lock();
     if (rref_ptr == nullptr) {
@@ -160,6 +163,7 @@ void RRefContext::delAllUsers() {
     }
     rref_ptr->tryDel();
   }
+  LOG(ERROR) << getWorkerName() << ": Exiting delAllUsers()";
 }
 
 template <typename T>
