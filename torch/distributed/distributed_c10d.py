@@ -23,6 +23,7 @@ from torch._C._distributed_c10d import (
     GatherOptions,
     PrefixStore,
     ProcessGroup,
+    AllgatherOptions,
     ReduceOptions,
     ReduceOp,
     ReduceScatterOptions,
@@ -1804,8 +1805,9 @@ def scatter_object_list(
 
 def all_gather(tensor_list,
                tensor,
-               group=None,
-               async_op=False):
+               group=group.WORLD,
+               async_op=False,
+               inplace=False):
     """
     Gathers tensors from the whole group in a list.
 
@@ -1818,6 +1820,7 @@ def all_gather(tensor_list,
         group (ProcessGroup, optional): The process group to work on. If None,
             the default process group will be used.
         async_op (bool, optional): Whether this op should be an async op
+        inplace (bool, optional): Whether this op allows inplace calls
 
     Returns:
         Async work handle, if async_op is set to True.
@@ -1861,11 +1864,15 @@ def all_gather(tensor_list,
     tensor_list = [t if not t.is_complex() else torch.view_as_real(t) for t in tensor_list]
     tensor = tensor if not tensor.is_complex() else torch.view_as_real(tensor)
 
-    if group is None:
-        default_pg = _get_default_group()
-        work = default_pg.allgather([tensor_list], [tensor])
+    opts = AllgatherOptions()
+    opts.inplace = inplace
+
+
+    if group == GroupMember.WORLD:
+        _check_default_pg()
+        work = _default_pg.allgather([tensor_list], [tensor], opts)
     else:
-        work = group.allgather([tensor_list], [tensor])
+        work = group.allgather([tensor_list], [tensor], opts)
 
     if async_op:
         return work
@@ -2156,8 +2163,9 @@ def reduce_scatter_multigpu(output_tensor_list,
 def reduce_scatter(output,
                    input_list,
                    op=ReduceOp.SUM,
-                   group=None,
-                   async_op=False):
+                   group=group.WORLD,
+                   async_op=False,
+                   inplace=False):
     """
     Reduces, then scatters a list of tensors to all processes in a group.
 
@@ -2167,6 +2175,7 @@ def reduce_scatter(output,
         group (ProcessGroup, optional): The process group to work on. If None,
             the default process group will be used.
         async_op (bool, optional): Whether this op should be an async op.
+        inplace (bool, optional): Whether this op allows inplace calls.
 
     Returns:
         Async work handle, if async_op is set to True.
@@ -2180,6 +2189,7 @@ def reduce_scatter(output,
 
     opts = ReduceScatterOptions()
     opts.reduceOp = op
+    opts.inplace = inplace
 
     if group is None:
         default_pg = _get_default_group()
