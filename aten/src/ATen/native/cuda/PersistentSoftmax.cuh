@@ -8,6 +8,8 @@
 #include <cuda_fp16.h>
 #include <c10/macros/Macros.h>
 
+#include <ATen/native/TensorIterator.h>
+#include <ATen/native/cuda/Loops.cuh>
 #include <ATen/native/cuda/MemoryAccess.cuh>
 
 namespace {
@@ -64,16 +66,20 @@ __device__ __forceinline__ void warp_reduce(acc_t* sum) {
 // input_t_float, acc_t=float, output_t=half  => read float tensor, float accumulators, write half tensor.
 
 template <typename input_t, typename output_t, typename acc_t, int log2_elements, bool is_log_softmax, int INPUT_VEC, int OUTPUT_VEC>
-__global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batch_size, int stride, int element_count)
+__global__ void softmax_warp_forward(output_t *dst, input_t *src, int batch_size, int stride, int element_count)
 {
     // WARP_SIZE and WARP_BATCH must match the return values batches_per_warp and warp_size of method warp_softmax_forward_kernel.
     constexpr int next_power_of_two = 1 << log2_elements;
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
-    constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
+    constexpr int WARP_ITERATIONS = std::max(next_power_of_two / WARP_SIZE / INPUT_VEC, 1);
     constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
 
-    using loadT = memory::aligned_vector<input_t, INPUT_VEC>;
-    using storeT = memory::aligned_vector<output_t, OUTPUT_VEC>;
+    if (threadIdx.x == 0) {
+      printf("WARP_ITERATIONS: %d, WARP_BATCH: %d\n", WARP_ITERATIONS, WARP_BATCH);
+    }
+
+    using loadT = at::native::memory::aligned_vector<input_t, INPUT_VEC>;
+    using storeT = at::native::memory::aligned_vector<output_t, OUTPUT_VEC>;
 
     int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * WARP_BATCH;
 
@@ -86,8 +92,13 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     // there might be multiple batches per warp. compute the index within the batch
     int local_idx = threadIdx.x;
 
-    src += first_batch * stride + local_idx;
-    dst += first_batch * stride + local_idx;
+    // alias pointer into the src & dst buffers
+    // Move forward to the first batch this warp will handle,
+    // and take into account threadIdx and vector size.
+    // first_batch * stride indexes into row
+    // local_idx * INPUT_VEC indexes into position within that row.
+    src += first_batch * stride + local_idx * INPUT_VEC;
+    dst += first_batch * stride + local_idx * INPUT_VEC;
 
     // The nested loops over WARP_BATCH and then WARP_ITERATIONS can be simplified to one loop,
     // but I think doing so would obfuscate the logic of the algorithm, thus I chose to keep
@@ -95,23 +106,47 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     // This should have no impact on performance because the loops are unrolled anyway.
 
     // load data from global memory
-    acc_t elements[WARP_BATCH][WARP_ITERATIONS];
-    loadT value;
+    // Each iteration is going to read INPUT_VEC elements at a time
+    // with WARP_ITERATIONS adjusted accordingly
+    acc_t elements[WARP_BATCH][WARP_ITERATIONS][INPUT_VEC];
     for (int i = 0;  i < WARP_BATCH;  ++i) {
+        // how many elements in this batch need to be handled?
         int batch_element_count = (i >= local_batches) ? 0 : element_count;
-        // jump forward by vector size instead of 1 -> if INPUT_VEC == 1 then old path
-        for (int it = 0;  it < WARP_ITERATIONS;  it += INPUT_VEC) {
-            int element_index = local_idx + it * WARP_SIZE;
-            // vectorized path
-            if (element_index + VEC_SIZE < batch_element_count) {
+        // if (threadIdx.x == 0) printf("i(%d, %d): %d - batch_element_count: %d\n", blockIdx.x, blockIdx.y, i, batch_element_count);
+
+        // For each iteration we'll grab INPUT_VEC values
+        for (int it = 0;  it < WARP_ITERATIONS;  it++) {
+            // it * WARP_SIZE is multiples of WARP_SIZE, local_idx \in [0, 32)
+            // So we need to multiply this by INPUT_VEC
+            // local_idx is threadIdx, it*WARP_SIZE is how many strides we've taken, INPUT_VEC is size of those strides
+            int element_index = (local_idx + it * WARP_SIZE) * INPUT_VEC;
+            //printf("tid: %d - it: %d - element_index: %d - %d - %d\n", local_idx, it, element_index, element_index + INPUT_VEC, batch_element_count);
+            // vectorized path - can this thread read a full vector
+            if (element_index + INPUT_VEC <= batch_element_count) {
                 // perform vectorized read
-                LoadT *input = reinterpret_cast<loadT*>(&elements[i][it]);
-                *input = *reinterpret_cast<const loadT*>(&src[i*element_count+it*WARP_SIZE]);
+                //printf("tid: %d - vectorized: input idx: %d\n", local_idx, i*element_count+it*WARP_SIZE*INPUT_VEC);
+
+                // alias into the register elements buffer
+                loadT *input = reinterpret_cast<loadT*>(&elements[i][it][0]);
+                // Read from the global buffer
+                // Note: src already takes into account the threadIdx and first batch offset
+                // i * element_count is offset into batch number
+                // it * WARP_SIZE * INPUT_VEC is the offset within that batch
+                *input = *reinterpret_cast<const loadT*>(&src[i*element_count+it*WARP_SIZE*INPUT_VEC]);
+
+                //printf("tid: %d read %f %f %f %f\n", local_idx, elements[i][it][0], elements[i][it][1],elements[i][it][2],elements[i][it][3]);
             } else {
-                if (element_index < batch_element_count) {
-                    elements[i][it] = src[i*element_count+it*WARP_SIZE];
-                } else {
-                    elements[i][it] = -std::numeric_limits<acc_t>::infinity();
+                if (threadIdx.x == 3) printf("non-vectorized load path\n");
+                // can't do a vectorized load, load what we can
+                int vec_idx = 0;
+                for (int j = element_index ; j < element_index + INPUT_VEC; ++j) {
+                    if (j < batch_element_count) {
+                        elements[i][it][vec_idx] = src[i*element_count+it*WARP_SIZE*INPUT_VEC + j];
+                    } else {
+                        elements[i][it][vec_idx] = -std::numeric_limits<acc_t>::infinity();
+                    }
+                    if (threadIdx.x == 3) printf("j: %d, batch_element_count: %d, read %f\n", j, batch_element_count, elements[i][it][vec_idx]);
+                    vec_idx++;
                 }
             }
         }
@@ -121,28 +156,51 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
     acc_t max_value[WARP_BATCH];
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
-        max_value[i] = elements[i][0];
+        max_value[i] = elements[i][0][0];
         #pragma unroll
-        for (int it = 1;  it < WARP_ITERATIONS;  ++it) {
-            max_value[i] = (max_value[i] > elements[i][it]) ? max_value[i] : elements[i][it];
+        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
+            #pragma unroll
+            for (int v = 0; v < INPUT_VEC; ++v) {
+                max_value[i] = (max_value[i] > elements[i][it][v]) ? max_value[i] : elements[i][it][v];
+            }
         }
     }
+    printf("tid: %d max_value: %f\n", local_idx, max_value[0]);
+    __syncthreads();
+    printf("reducing max\n");
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Max>(max_value);
+    printf("tid: %d max_value: %f\n", local_idx, max_value[0]);
+    __syncthreads();
 
     acc_t sum[WARP_BATCH] { 0.0f };
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
+        sum[i] = 0.f;
         #pragma unroll
         for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            if (is_log_softmax) {
-              sum[i] += std::exp(elements[i][it] - max_value[i]);
-            } else {
-              elements[i][it] = std::exp(elements[i][it] - max_value[i]);
-              sum[i] += elements[i][it];
+            for (int v = 0; v < INPUT_VEC; ++v) {
+                if (is_log_softmax) {
+                  sum[i] += std::exp(elements[i][it][v] - max_value[i]);
+                } else {
+                  elements[i][it][v] = std::exp(elements[i][it][v] - max_value[i]);
+                  sum[i] += elements[i][it][v];
+                  if (threadIdx.x == 3) {
+                    printf("sum[%d] now %f, added %f\n", i, sum[i], elements[i][it][v]);
+                  }
+                }
             }
         }
     }
+    __syncthreads();
+    printf("after sum\n");
+    printf("tid: %d sum : %f\n", local_idx, sum[0]);
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(sum);
+    for (int ii = 0; ii < WARP_BATCH; ++ii) {
+        if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+          printf("max value: %f\n", (float)max_value[ii]);
+          printf("sum: %f\n", (float)sum[ii]);
+        }
+    }
 
     // store result
     #pragma unroll
@@ -151,31 +209,31 @@ __global__ void softmax_warp_forward(output_t *dst, const input_t *src, int batc
             break;
         if (is_log_softmax) sum[i] = max_value[i] + std::log(sum[i]);
         #pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS; it += OUTPUT_VEC) {
-            int element_index = local_idx + it * WARP_SIZE;
+        for (int it = 0;  it < WARP_ITERATIONS; it++) {
+            int element_index = (local_idx + it * WARP_SIZE) * INPUT_VEC;
 
-            if (element_index + OUTPUT_VEC < element_count) {
+            if (element_index + INPUT_VEC < element_count) {
               // need to perform the final calculation in registers first as we'll then
               // write out vectorized
-              for (int it_i = it; it_i < it + OUTPUT_VEC; it_i++) {
-                if (is_log_softmax) {
-                  elements[i][it_i] -= sum[i];
-                } else {
-                  elements[i][it_i] /= sum[i];
-                }
+              for (int v = 0; v < INPUT_VEC; ++v) {
+                  if (is_log_softmax) {
+                    elements[i][it][v] -= sum[i];
+                  } else {
+                    elements[i][it][v] /= sum[i];
+                  }
               }
               // perform vectorized write
-              storeT *output = reinterpret_cast<storeT*>(&dst[i*element_count+it*WARP_SIZE]);
-              *output = *reinterpret_cast<storeT*>(&elements[i][it]);
+              storeT *output = reinterpret_cast<storeT*>(&dst[i*element_count+it*WARP_SIZE*INPUT_VEC]);
+              *output = *reinterpret_cast<storeT*>(&elements[i][it][0]);
             } else {
-                if (element_index < element_count) {
-                    if (is_log_softmax) {
-                        dst[i*element_count+it*WARP_SIZE] = elements[i][it] - sum[i];
-                    } else {
-                        dst[i*element_count+it*WARP_SIZE] = elements[i][it] / sum[i];
-                    }
-                } else {
-                    break;
+                  for (int vec_idx = 0; vec_idx < INPUT_VEC; ++vec_idx) {
+                      if (element_index + vec_idx < element_count) {
+                      if (is_log_softmax) {
+                          dst[i*element_count+it*WARP_SIZE + vec_idx] = elements[i][it][vec_idx] - sum[i];
+                      } else {
+                          dst[i*element_count+it*WARP_SIZE + vec_idx] = elements[i][it][vec_idx] / sum[i];
+                      }
+                  }
                 }
             }
         }
@@ -264,7 +322,7 @@ __global__ void softmax_warp_backward(output_t *gradInput, const input_t *grad, 
 } // end of anonymous namespace
 
 template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax, int INPUT_VEC, int OUTPUT_VEC>
-void dispatch_softmax_forward_elements(output_t *dst, const input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count)
+void dispatch_softmax_forward_elements(output_t *dst, input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count)
 {
     TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 1024 );
     if (softmax_elements == 0) {
@@ -286,6 +344,8 @@ void dispatch_softmax_forward_elements(output_t *dst, const input_t *src, int so
         int batches_per_block = warps_per_block * batches_per_warp;
         int blocks = (batch_count + batches_per_block - 1) / batches_per_block;
         dim3 threads(warp_size, warps_per_block, 1);
+        // dim3 threads(warp_size, 1, 1);
+        printf("threads: %d, %d blocks: %d\n", threads.x, threads.y, blocks);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
         switch (log2_elements) {
             case 0: // 1
@@ -336,6 +396,8 @@ void dispatch_softmax_forward_elements(output_t *dst, const input_t *src, int so
                 break;
         }
     }
+    cudaDeviceSynchronize();
+    printf("Finished running\n");
 }
 
 template <typename input_t, typename output_t>
@@ -345,13 +407,17 @@ int get_vector_size(const input_t *input_ptr, const output_t *output_ptr, int st
       at::native::memory::can_vectorize_up_to<output_t>((char*)output_ptr)
   );
 
-  if (proposed_vec % stride != 0) proposed_vec = 1;
+  printf("proposed_vec: %d\n", proposed_vec);
+  // This is tricky - want to make sure that each row of the input is aligned to proposed vector length
+  if (stride % proposed_vec != 0) proposed_vec = 1;
+  printf("proposed_vec: %d, stride: %d\n", proposed_vec, stride);
 
   return proposed_vec;
 }
 
 template<typename input_t, typename output_t, typename acc_t, bool is_log_softmax>
-void dispatch_softmax_forward(output_t *dst, const input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count) {
+void dispatch_softmax_forward(output_t *dst, input_t *src, int softmax_elements, int softmax_elements_stride, int batch_count) {
+  printf("softmax_elements: %d, softmax_elements_stride: %d, batch_count: %d\n", softmax_elements,softmax_elements_stride,batch_count);
   int vec_size = get_vector_size<input_t, output_t>(src, dst, softmax_elements_stride);
 
   printf("HEEEEERE!\n");
