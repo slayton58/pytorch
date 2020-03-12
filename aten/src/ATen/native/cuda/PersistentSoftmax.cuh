@@ -324,7 +324,7 @@ void dispatch_softmax_forward_elements(output_t *dst, input_t *src, int softmax_
         int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
 
         // This value must match the WARP_BATCH constexpr value computed inside softmax_warp_forward.
-        int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
+        int batches_per_warp = (next_power_of_two <= 128) ? 4 : 1;
 
         // use 128 threads per block to maximimize gpu utilization
         constexpr int threads_per_block = 128;
