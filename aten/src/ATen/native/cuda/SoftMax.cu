@@ -19,6 +19,8 @@ namespace native {
 
 namespace {
 
+constexpr int ALIGN_BYTES = 16;
+
 template<typename T, typename AccumT, typename OutT>
 struct LogSoftMaxForwardEpilogue {
   __device__ __forceinline__ LogSoftMaxForwardEpilogue(AccumT max_input, AccumT sum)
@@ -139,7 +141,7 @@ void SpatialSoftMax_getLaunchSizes(
 inline dim3 SoftMax_getBlockSize(int ILP, uint64_t dim_size) {
   uint64_t block_size = 1;
   uint64_t max_block_size = std::min(dim_size / ILP, static_cast<uint64_t>(max_threads));
-  while (block_size < max_block_size) block_size *= 2;
+  while (block_size < (max_block_size/2)) block_size *= 2;
   // Launch at least a single warp - the kernel assumes that.
   block_size = std::max(block_size, static_cast<uint64_t>(C10_WARP_SIZE));
   return dim3(block_size);
@@ -369,6 +371,7 @@ blockReduce(AccumT* smem, AccumT val,
   return smem[0];
 }
 
+#if 0
 template <template<typename, typename> class Reduction, int ILP, typename T, typename AccumT>
 __device__ __forceinline__ AccumT
 ilpReduce(T* data,
@@ -400,6 +403,104 @@ ilpReduce(T* data,
 
   return threadVal;
 }
+#else
+template <template<typename, typename> class Reduction, int ILP, typename T, typename AccumT>
+__device__ __forceinline__ AccumT
+ilpReduce(int shift,
+          T* data,
+          int size,
+          const Reduction<T, AccumT>& r,
+          AccumT defaultVal)
+{
+  typedef typename std::aligned_storage<ILP*sizeof(T), ILP*alignof(T)>::type LoadT;
+  AccumT threadVal = defaultVal;
+  int offset = threadIdx.x;
+
+  // shift and do 1
+  if(shift > 0){
+    data -= shift;
+    size += shift;
+    if(threadIdx.x >= shift){
+      threadVal = r(threadVal, data[offset]);
+    }
+    size -= blockDim.x;
+    data += blockDim.x;
+  }
+  int last = size % (ILP * blockDim.x);
+
+  T v[ILP];
+  LoadT* value = reinterpret_cast<LoadT*>(&v);
+
+  for (; offset * ILP < (size - last); offset += blockDim.x) {
+    *value = reinterpret_cast<LoadT*>(data)[offset];
+
+    for (int j = 0; j < ILP; ++j) {
+      threadVal = r(threadVal, v[j]);
+    }
+  }
+
+  offset = size - last + threadIdx.x;
+  // Epilogue
+  for (; offset < size; offset += blockDim.x)
+    threadVal = r(threadVal, data[offset]);
+
+  return threadVal;
+}
+
+template <template<typename, typename> class Reduction1, template<typename, typename> class Reduction2, int ILP, typename T, typename AccumT>
+__device__ __forceinline__ void
+ilpReduce(int shift,
+          T* data,
+          int size,
+          AccumT* reducVal1,
+          const Reduction1<T, AccumT>& r1,
+          AccumT defaultVal1,
+          AccumT* reducVal2,
+          const Reduction2<T, AccumT>& r2,
+          AccumT defaultVal2)
+{
+  typedef typename std::aligned_storage<ILP*sizeof(T), ILP*alignof(T)>::type LoadT;
+
+  AccumT threadVal1 = defaultVal1;
+  AccumT threadVal2 = defaultVal2;
+  int offset = threadIdx.x;
+
+  // shift and do 1
+  if(shift > 0){
+    data -= shift;
+    size += shift;
+    if(threadIdx.x >= shift){
+      threadVal1 = r1(threadVal1, data[offset]);
+      threadVal2 = r2(threadVal2, data[offset]);
+    }
+    size -= blockDim.x;
+    data += blockDim.x;
+  }
+  int last = size % (ILP * blockDim.x);
+
+  T v[ILP];
+  LoadT* value = reinterpret_cast<LoadT*>(&v);
+
+  for (; offset * ILP < (size - last); offset += blockDim.x) {
+    *value = reinterpret_cast<LoadT*>(data)[offset];
+
+    for (int j = 0; j < ILP; ++j) {
+      threadVal1 = r1(threadVal1, v[j]);
+      threadVal2 = r2(threadVal2, v[j]);
+    }
+  }
+
+  offset = size - last + threadIdx.x;
+  // Epilogue
+  for (; offset < size; offset += blockDim.x) {
+    threadVal1 = r1(threadVal1, data[offset]);
+    threadVal2 = r2(threadVal2, data[offset]);
+  }
+
+  *reducVal1 = threadVal1;
+  *reducVal2 = threadVal2;
+}
+#endif
 
 template <int ILP, typename scalar_t, typename accscalar_t, typename outscalar_t, template <typename, typename, typename> class Epilogue>
 __global__ void
@@ -412,15 +513,16 @@ cunn_SoftMaxForward(outscalar_t *output, scalar_t *input, int classes)
   input += blockIdx.x * classes;
   output += blockIdx.x * classes;
 
+	const int shift = ((uint64_t)input) % ALIGN_BYTES / sizeof(scalar_t);
   // find the max
   accscalar_t threadMax = ilpReduce<MaxFloat, ILP, scalar_t, accscalar_t>(
-      input, classes, MaxFloat<scalar_t, accscalar_t>(), -at::numeric_limits<accscalar_t>::max());
+      shift, input, classes, MaxFloat<scalar_t, accscalar_t>(), -at::numeric_limits<accscalar_t>::max());
   accscalar_t max_k = blockReduce<Max, accscalar_t>(
       sdata, threadMax, Max<accscalar_t>(), -at::numeric_limits<accscalar_t>::max());
 
   // reduce all values
   accscalar_t threadExp = ilpReduce<SumExpFloat, ILP, scalar_t, accscalar_t>(
-      input, classes, SumExpFloat<scalar_t, accscalar_t>(max_k), static_cast<accscalar_t>(0));
+      shift, input, classes, SumExpFloat<scalar_t, accscalar_t>(max_k), static_cast<accscalar_t>(0));
   accscalar_t sumAll = blockReduce<Add, accscalar_t>(
       sdata, threadExp, Add<accscalar_t>(), static_cast<accscalar_t>(0));
 
@@ -453,8 +555,10 @@ cunn_SoftMaxBackward(scalar_t *gradInput, outscalar_t *output, outscalar_t *grad
   output += blockIdx.x * classes;
   gradOutput += blockIdx.x * classes;
 
+	const int shift = ((uint64_t)gradInput) % ALIGN_BYTES / sizeof(scalar_t);
+
   accscalar_t threadSum = ilpReduce<AddFloat, 4, outscalar_t, accscalar_t>(
-      gradOutput, classes, AddFloat<outscalar_t, accscalar_t>(), accscalar_t(0));
+      shift, gradOutput, classes, AddFloat<outscalar_t, accscalar_t>(), accscalar_t(0));
   accscalar_t sum_k = blockReduce<Add, accscalar_t>(
         sdata, threadSum, Add<accscalar_t>(), accscalar_t(0));
 
