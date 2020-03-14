@@ -1879,6 +1879,7 @@ def all_gather(tensor_list,
     else:
         work.wait()
 
+
 def all_gather_coalesced(output_tensor_lists,
                          input_tensor_list,
                          group=None,
