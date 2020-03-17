@@ -15,6 +15,7 @@ from typing import Dict, Optional, Tuple, Union
 from .constants import default_pg_timeout
 from .rendezvous import rendezvous, register_rendezvous_handler  # noqa: F401
 from torch._C._distributed_c10d import (
+    AllgatherOptions,
     AllreduceOptions,
     AllreduceCoalescedOptions,
     AllToAllOptions,
@@ -1807,7 +1808,7 @@ def all_gather(tensor_list,
                tensor,
                group=group.WORLD,
                async_op=False,
-               inplace=False):
+               no_copy=False):
     """
     Gathers tensors from the whole group in a list.
 
@@ -1820,7 +1821,12 @@ def all_gather(tensor_list,
         group (ProcessGroup, optional): The process group to work on. If None,
             the default process group will be used.
         async_op (bool, optional): Whether this op should be an async op
-        inplace (bool, optional): Whether this op allows inplace calls
+        no_copy (bool, optional): Do not unflatten output tensors if they
+            are already contiguous views into an already flattened tensor
+            and backend is NCCL. If input tensor shares storage with
+            output tensors, it must be properly aligned, i.e.
+            offset == rank * flat_output.numel() // world_size.
+            In all other circumstances this argument has no effect.
 
     Returns:
         Async work handle, if async_op is set to True.
@@ -1865,7 +1871,7 @@ def all_gather(tensor_list,
     tensor = tensor if not tensor.is_complex() else torch.view_as_real(tensor)
 
     opts = AllgatherOptions()
-    opts.inplace = inplace
+    opts.noCopy = no_copy
 
 
     if group == GroupMember.WORLD:
@@ -2166,7 +2172,7 @@ def reduce_scatter(output,
                    op=ReduceOp.SUM,
                    group=group.WORLD,
                    async_op=False,
-                   inplace=False):
+                   no_copy=False):
     """
     Reduces, then scatters a list of tensors to all processes in a group.
 
@@ -2176,7 +2182,12 @@ def reduce_scatter(output,
         group (ProcessGroup, optional): The process group to work on. If None,
             the default process group will be used.
         async_op (bool, optional): Whether this op should be an async op.
-        inplace (bool, optional): Whether this op allows inplace calls.
+        no_copy (bool, optional): Do not flatten input tensors if they are
+            contiguous views into an already flattened tensor and backend
+            is NCCL. If output tensor shares storage with input tensors,
+            it must be properly aligned, i.e.
+            offset == rank * flat_input.numel() // world_size.
+            In all other circumstances this argument has no effect.
 
     Returns:
         Async work handle, if async_op is set to True.
@@ -2190,7 +2201,7 @@ def reduce_scatter(output,
 
     opts = ReduceScatterOptions()
     opts.reduceOp = op
-    opts.inplace = inplace
+    opts.noCopy = no_copy
 
     if group is None:
         default_pg = _get_default_group()
