@@ -508,6 +508,10 @@ cunn_SoftMaxForward(outscalar_t *output, scalar_t *input, int classes)
 {
   extern __shared__ unsigned char smem[];
   auto sdata = reinterpret_cast<accscalar_t*>(smem);
+
+  using LoadT = at::native::memory::aligned_vector<scalar_t, ILP>;
+  using StoreT = at::native::memory::aligned_vector<outscalar_t, ILP>;
+
   // forward pointers to batch[blockIdx.x]
   // each block handles a sample in the mini-batch
   input += blockIdx.x * classes;
@@ -529,18 +533,34 @@ cunn_SoftMaxForward(outscalar_t *output, scalar_t *input, int classes)
   Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(max_k, sumAll);
   int offset = threadIdx.x;
   int last = classes % (ILP * blockDim.x);
+  // outer grid-stride-loop over ILP elements
+  scalar_t tmp[ILP];
+  outscalar_t output_tmp[ILP];
+  LoadT *tmp_vec = reinterpret_cast<LoadT*>(&tmp[0]);
   for (; offset < classes - last; offset += blockDim.x * ILP) {
-    scalar_t tmp[ILP];
 
-#pragma unroll
-    for (int j = 0; j < ILP; ++j)
-      tmp[j] = input[offset + j * blockDim.x];
+    // Each loop is going to handle threadIdx.x * ILP values
+    // offset is threadIdx.x, so stride is j * blockDim.x * ILP
+// #pragma unroll
+    //for (int j = 0; j < ILP; ++j) {
+      *tmp_vec = *reinterpret_cast<LoadT*>(&input[offset * ILP]);
+      // tmp[j] = input[offset + j * blockDim.x];
+    //}
+    #pragma unroll
+    for (int j = 0; j < ILP; ++j) {
+      output_tmp[j] = epilogue(tmp[j]);
+    }
 
-#pragma unroll
-    for (int j = 0; j < ILP; ++j)
-      output[offset + j * blockDim.x] = epilogue(tmp[j]);
+
+    // #pragma unroll
+    // for (int j = 0; j < ILP; ++j) {
+    //   output[offset + j * blockDim.x] = epilogue(tmp[j]);
+    // }
+    StoreT *out_vec = reinterpret_cast<StoreT*>(&output[offset * ILP]);
+    *out_vec = *reinterpret_cast<StoreT*>(&output_tmp[0]);
   }
 
+  // this handles the tail
   for (; offset < classes; offset += blockDim.x)
     output[offset] = epilogue(input[offset]);
 }
@@ -549,6 +569,9 @@ template <int ILP, typename scalar_t, typename accscalar_t, typename outscalar_t
 __global__ void
 cunn_SoftMaxBackward(scalar_t *gradInput, outscalar_t *output, outscalar_t *gradOutput, int classes)
 {
+  using LoadT = at::native::memory::aligned_vector<scalar_t, ILP>;
+  using StoreT = at::native::memory::aligned_vector<outscalar_t, ILP>;
+
   extern __shared__ unsigned char smem[];
   auto sdata = reinterpret_cast<accscalar_t*>(smem);
   gradInput += blockIdx.x * classes;
@@ -565,19 +588,31 @@ cunn_SoftMaxBackward(scalar_t *gradInput, outscalar_t *output, outscalar_t *grad
   Epilogue<scalar_t, accscalar_t, outscalar_t> epilogue(sum_k);
   int offset = threadIdx.x;
   int last = classes % (ILP * blockDim.x);
+
+  outscalar_t tmpGradOutput[ILP];
+  outscalar_t tmpOutput[ILP];
+  outscalar_t tmpFinal[ILP];
+  StoreT *tmpGradOut_vec = reinterpret_cast<StoreT*>(&tmpGradOutput[0]);
+  StoreT *tmpOut_vec = reinterpret_cast<StoreT*>(&tmpOutput[0]);
+  StoreT *final_vec = reinterpret_cast<StoreT*>(&tmpFinal[0]);
+
   for (; offset < classes - last; offset += blockDim.x * ILP) {
-    outscalar_t tmpGradOutput[ILP];
-    outscalar_t tmpOutput[ILP];
+
+    *tmpGradOut_vec = *reinterpret_cast<StoreT*>(&gradOutput[offset * ILP]);
+    *tmpOut_vec = *reinterpret_cast<StoreT*>(&output[offset * ILP]);
+// #pragma unroll
+//     for (int j = 0; j < ILP; ++j) {
+//       tmpGradOutput[j] = gradOutput[offset + j * blockDim.x];
+//       tmpOutput[j] = output[offset + j * blockDim.x];
+//     }
 
 #pragma unroll
     for (int j = 0; j < ILP; ++j) {
-      tmpGradOutput[j] = gradOutput[offset + j * blockDim.x];
-      tmpOutput[j] = output[offset + j * blockDim.x];
+      // gradInput[offset + j * blockDim.x] = epilogue(tmpGradOutput[j], tmpOutput[j]);
+      tmpFinal[j] = epilogue(tmpGradOutput[j], tmpOutput[j]);
     }
 
-#pragma unroll
-    for (int j = 0; j < ILP; ++j)
-      gradInput[offset + j * blockDim.x] = epilogue(tmpGradOutput[j], tmpOutput[j]);
+    *reinterpret_cast<StoreT*>(&gradInput[offset * ILP]) = *final_vec;
   }
 
   for (; offset < classes; offset += blockDim.x)
@@ -610,10 +645,10 @@ Tensor host_softmax(const Tensor & input_, const int64_t dim_, const bool half_t
       inner_size *= input.size(i);
     // This kernel spawns a block per each element in the batch.
     // XXX: it assumes that inner_size == 1
-    printf("in .cpp\n");
 
     if (inner_size == 1) {
-      const int ILP = 2;
+      // Why was this 2?
+      const int ILP = 4;
       dim3 grid(outer_size);
       dim3 block = SoftMax_getBlockSize(ILP, dim_size);
       AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "host_softmax", [&] {
@@ -697,7 +732,7 @@ Tensor host_softmax_backward(const Tensor &grad_, const Tensor &output_, int64_t
 // See descriptions of kernels above.
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (inner_size == 1) {
-    const int ILP = 2;
+    const int ILP = 4;
     dim3 grid(outer_size);
     dim3 block = SoftMax_getBlockSize(ILP, dim_size);
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(gI.scalar_type(), "host_softmax_backward", [&] {
