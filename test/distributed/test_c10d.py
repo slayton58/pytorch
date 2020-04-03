@@ -1957,13 +1957,32 @@ class ProcessGroupNCCLTest(TestCase):
                     reduce(tensors, self.rank, rt, op)
 
     @requires_nccl()
-    def test_allgather_ops(self):
+    @skip_if_rocm_single_process
+    def test_allgather_ops(self, no_copy=False, inplace=False):
         store = c10d.FileStore(self.file.name, self.world_size)
         pg = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
 
-        def allgather(output_ts, input_ts):
-            work = pg.allgather(output_ts, input_ts)
+        def allgather(output_ts, input_ts, no_copy):
+            opts = c10d.AllgatherOptions()
+            opts.noCopy = no_copy
+            work = pg.allgather(output_ts, input_ts, opts)
             work.wait()
+
+        def flatten(tl, outer_dim, inner_dim):
+            nels = tl[0][0].numel()
+            dtype = tl[0][0].dtype
+            new_tl = [
+                    torch.empty(dtype=dtype,size=[nels*inner_dim]).cuda(i)
+                    for i in range(outer_dim)
+            ]
+            new_tl = [
+                    [
+                        new_tl[i][j*nels:(j+1)*nels].reshape(tl[i][j].size()).copy_(tl[i][j])
+                        for j in range(inner_dim)
+                    ]
+                    for i in range(outer_dim)
+            ]
+            return new_tl
 
         tensors = []
         output_ts = [[] for _ in range(self.num_gpus)]
@@ -1975,28 +1994,73 @@ class ProcessGroupNCCLTest(TestCase):
         for i in range(self.num_gpus):
             tensors.append(torch.tensor([i]).cuda(i))
 
-        allgather(output_ts, tensors)
+        if no_copy:
+            output_ts = flatten(output_ts, self.num_gpus, self.world_size*self.num_gpus)
+            if inplace:
+                # copy input tensors to output and set_ input tensors to share storage with output
+                tensors = [t.set_(outp[0].copy_(t)) for t, outp in zip(tensors, output_ts)]
+
+        allgather(output_ts, tensors, no_copy)
 
         # Verification
         for device_ts in output_ts:
             for s_idx, t in enumerate(device_ts):
                 self.assertEqual(torch.tensor([s_idx]), t)
 
+    def test_allgather_no_copy_ops(self):
+        self.test_allgather_ops(True,False)
+
+    def test_allgather_inplace_ops(self):
+        self.test_allgather_ops(True,True)
+
     @requires_nccl()
-    def test_reduce_scatter_ops(self):
+    @skip_if_rocm_single_process
+    def test_reduce_scatter_ops(self, no_copy=False, inplace=False):
+        assert (not inplace or no_copy), "inplace requires no_copy"
+
         store = c10d.FileStore(self.file.name, self.world_size)
         pg = c10d.ProcessGroupNCCL(store, self.rank, self.world_size)
 
-        def reduce_scatter(outputs, input_lists, op):
+        def reduce_scatter(outputs, input_lists, op, no_copy):
             opts = c10d.ReduceScatterOptions()
             opts.reduceOp = op
+            opts.noCopy = no_copy
             work = pg.reduce_scatter(outputs, input_lists, opts)
             work.wait()
+
+        def maybe_flatten(tl, outp, outer_dim, inner_dim, flatten, inplace):
+            if flatten:
+                nels = tl[0][0].numel()
+                dtype = tl[0][0].dtype
+                new_tl = [
+                        torch.empty(dtype=dtype,size=[nels*inner_dim]).cuda(i)
+                        for i in range(outer_dim)
+                ]
+                new_tl = [
+                        [
+                            new_tl[i][j*nels:(j+1)*nels].reshape(tl[i][j].size()).copy_(tl[i][j])
+                            for j in range(inner_dim)
+                        ]
+                        for i in range(outer_dim)
+                ]
+                if inplace:
+                    new_outp = [
+                            new_tl[i][0]
+                            for i in range(outer_dim)
+                    ]
+                    return new_tl, new_outp
+                else:
+                    return new_tl, outp
+            else:
+                return tl, outp
 
         virtual_rank = self.rank * self.world_size
         virtual_world_size = self.num_gpus * self.world_size
 
-        output = [torch.tensor([0]).cuda(i) for i in range(self.num_gpus)]
+        orig_output = [
+            torch.tensor([0]).cuda(i)
+            for i in range(self.num_gpus)
+        ]
 
         #           0                   1                   2
         #   0   [0..11]             [1..12]
@@ -2005,7 +2069,7 @@ class ProcessGroupNCCLTest(TestCase):
         #   3
 
         # Sum
-        tensor_lists = [
+        orig_tensor_lists = [
             [
                 torch.tensor([self.rank * self.num_gpus + i + j]).cuda(i)
                 for j in range(virtual_world_size)
@@ -2013,7 +2077,8 @@ class ProcessGroupNCCLTest(TestCase):
             for i in range(self.num_gpus)
         ]
 
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.SUM)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.SUM, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor(
@@ -2026,14 +2091,16 @@ class ProcessGroupNCCLTest(TestCase):
             self.assertEqualIgnoreType(expected, output[i])
 
         # Min
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MIN)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MIN, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor([self.rank * self.world_size + i])
             self.assertEqual(expected, output[i])
 
         # Max
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MAX)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.MAX, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor(
@@ -2042,7 +2109,7 @@ class ProcessGroupNCCLTest(TestCase):
             self.assertEqual(expected, output[i])
 
         # Product
-        tensor_lists = [
+        orig_tensor_lists = [
             [
                 torch.tensor(
                     [(self.rank * self.num_gpus + i + j) % virtual_world_size + 1]
@@ -2052,12 +2119,19 @@ class ProcessGroupNCCLTest(TestCase):
             for i in range(self.num_gpus)
         ]
 
-        reduce_scatter(output, tensor_lists, c10d.ReduceOp.PRODUCT)
+        tensor_lists, output = maybe_flatten(orig_tensor_lists, orig_output, self.num_gpus, virtual_world_size, no_copy, inplace)
+        reduce_scatter(output, tensor_lists, c10d.ReduceOp.PRODUCT, no_copy)
 
         for i in range(self.num_gpus):
             expected = torch.tensor([float(math.factorial(virtual_world_size))])
             # TODO(#38095): Replace assertEqualIgnoreType. See issue #38095
             self.assertEqualIgnoreType(expected, output[i])
+
+    def test_reduce_scatter_no_copy_ops(self):
+        self.test_reduce_scatter_ops(True, False)
+
+    def test_reduce_scatter_inplace_ops(self):
+        self.test_reduce_scatter_ops(True, True)
 
     @requires_nccl()
     def test_barrier(self):
