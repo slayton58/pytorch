@@ -1992,7 +1992,7 @@ class ProcessGroupNCCLTest(TestCase):
             tensors.append(torch.tensor([i]).cuda(i))
 
         if no_copy:
-            output_ts = flatten(output_ts, self.num_gpus, self.world_size*self.num_gpus)
+            output_ts = flatten(output_ts, self.num_gpus, self.world_size * self.num_gpus)
             if inplace:
                 # copy input tensors to output and set_ input tensors to share storage with output
                 tensors = [t.set_(outp[0].copy_(t)) for t, outp in zip(tensors, output_ts)]
@@ -2005,10 +2005,10 @@ class ProcessGroupNCCLTest(TestCase):
                 self.assertEqual(torch.tensor([s_idx]), t)
 
     def test_allgather_no_copy_ops(self):
-        self.test_allgather_ops(True,False)
+        self.test_allgather_ops(True, False)
 
     def test_allgather_inplace_ops(self):
-        self.test_allgather_ops(True,True)
+        self.test_allgather_ops(True, True)
 
     @requires_nccl()
     @skip_if_rocm_single_process
