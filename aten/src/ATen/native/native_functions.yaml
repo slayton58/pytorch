@@ -7151,7 +7151,7 @@
     CUDA: _scaled_mm_cuda
   tags: needs_exact_strides
 
-- func: _scaled_mm_v2(Tensor self, Tensor mat2, Tensor[] scale_a, int[] recipe_a, int[] swizzle_a, Tensor[] scale_b, int[] recipe_b, int[] swizzle_b, Tensor? bias, ScalarType? out_dtype, Tensor[] scale_output, int[] recipe_output, int[] contraction_dim=[-1,-2]) -> Tensor[]
+- func: _scaled_mm_v2(Tensor self, Tensor mat2, Tensor[] scale_a, int[] recipe_a, int[] swizzle_a, Tensor[] scale_b, int[] recipe_b, int[] swizzle_b, Tensor? bias, ScalarType? out_dtype, Tensor[] scale_output, int[] recipe_output, int[] contraction_dim=[]) -> Tensor[]
   variants: function
   dispatch:
     CUDA: _scaled_mm_cuda_v2

@@ -2005,6 +2005,14 @@ _scaled_tensorwise_tensorwise(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are fp32
+  //
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.numel() == 1 && scale_a.scalar_type() == kFloat, "scale_a must have 1 Float element")
+  TORCH_CHECK(scale_b.numel() == 1 && scale_b.scalar_type() == kFloat, "scale_b must have 1 Float element")
+
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype));
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
@@ -2023,6 +2031,13 @@ _scaled_rowwise_rowwise(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are fp32, shape M
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.numel() == mat_a.sizes()[0] && scale_a.scalar_type() == kFloat, "scale_a must have", mat_a.sizes()[0], " Float elements, got ", scale_a.numel())
+  TORCH_CHECK(scale_b.numel() == mat_b.sizes()[0] && scale_b.scalar_type() == kFloat, "scale_b must have", mat_b.sizes()[0], " Float elements, got ", scale_b.numel())
+
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype));
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
   // NVIDIA's cuBLAS only started supporting row-wise scaling in version 12.9,
@@ -2089,6 +2104,15 @@ _scaled_block1x128_block1x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are fp32, shape K//128
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 128 && scale_a.scalar_type() == kFloat,
+      "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 128, " Float elements, got ", scale_a.sizes())
+  TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 128 && scale_b.scalar_type() == kFloat,
+      "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 128, " Float elements, got ", scale_b.sizes())
+
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype));
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
@@ -2106,6 +2130,15 @@ _scaled_block128x128_block1x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are fp32, shape K//128
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] / 128 && scale_a.sizes()[1] == mat_a.sizes()[1] / 128 && scale_a.scalar_type() == kFloat,
+      "scale_a must have shape ", mat_a.sizes()[0] / 128, " x ", mat_a.sizes()[1] / 128, " Float elements, got ", scale_a.sizes())
+  TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 128 && scale_b.scalar_type() == kFloat,
+      "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 128, " Float elements, got ", scale_b.sizes())
+
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype));
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
@@ -2123,6 +2156,14 @@ _scaled_block1x128_block128x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are fp32, A: shape K//128, B: K//128, N//128
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 128 && scale_a.scalar_type() == kFloat,
+      "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 128, " Float elements, got ", scale_a.sizes())
+  TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] / 128 && scale_b.sizes()[1] == mat_b.sizes()[1] / 128 && scale_b.scalar_type() == kFloat,
+      "scale_b must have shape ", mat_b.sizes()[0] / 128, " x ", mat_b.sizes()[1] / 128, " Float elements, got ", scale_b.sizes())
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype));
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
@@ -2132,6 +2173,56 @@ _scaled_block1x128_block128x128(
   _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
 
   return out;
+}
+
+Tensor
+_scaled_mxfp8_mxfp8(
+          const Tensor& mat_a, const Tensor& mat_b,
+          const Tensor& scale_a, const SwizzleType swizzle_a,
+          const Tensor& scale_b, const SwizzleType swizzle_b,
+          const std::optional<Tensor>& bias,
+          const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP8, scales are e8m0, A: shape K//32, B: K, N//32
+  // Scales must be swizzled
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 32 && scale_a.scalar_type() == kFloat8_e8m0fnu,
+      "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 32, " Float elements, got ", scale_a.sizes())
+  TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 32 && scale_b.scalar_type() == kFloat8_e8m0fnu,
+      "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 32, " Float elements, got ", scale_b.sizes())
+
+  TORCH_CHECK(swizzle_a == SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
+  TORCH_CHECK(swizzle_b == SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
+
+  auto scaling_choice_a = ScalingType::BlockWise1x32;
+  auto scaling_choice_b = ScalingType::BlockWise1x32;
+  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+}
+
+Tensor
+_scaled_nvfp4_nvfp4(
+          const Tensor& mat_a, const Tensor& mat_b,
+          const Tensor& scale_a, const Tensor& scale_b,
+          const std::optional<Tensor>& bias,
+          const c10::ScalarType out_dtype) {
+  // Restrictions:
+  // A, B are FP4, scales are e8m0, A: shape K//32, B: K, N//32
+  // Scales must be swizzled
+  TORCH_CHECK(mat_a.scalar_type() == at::kFloat4_e2m1fn_x2 && mat_b.scalar_type() == at::kFloat4_e2m1fn_x2, "mat_a and mat_b must be fp4 types, got: ",
+      mat_a.scalar_type(), mat_b.scalar_type());
+  TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 16 && scale_a.scalar_type() == kFloat8_e4m3fn,
+      "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 32, " Float elements, got ", scale_a.sizes())
+  TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 16 && scale_b.scalar_type() == kFloat8_e4m3fn,
+      "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 32, " Float elements, got ", scale_b.sizes())
+
+  TORCH_CHECK(swizzle_a == SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
+  TORCH_CHECK(swizzle_b == SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
+
+  auto scaling_choice_a = ScalingType::BlockWise1x32;
+  auto scaling_choice_b = ScalingType::BlockWise1x32;
+  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  return { mat_a };
 }
 
 std::vector<Tensor>
@@ -2148,6 +2239,26 @@ _scaled_mm_cuda_v2(
           ArrayRef<Tensor> scale_output,
           ArrayRef<long> recipe_output,
           ArrayRef<long> contraction_dim) {
+  // Check sizes
+  bool allowed_device = _scaled_mm_allowed_device();
+  TORCH_CHECK(allowed_device, "torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+");
+  TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a matrix");
+  TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a matrix");
+
+  if (contraction_dim.size() > 0) {
+    TORCH_CHECK(contraction_dim.size() == 2, "contraction_dim must have exactly 2 elements");
+    auto mat_a_dim = contraction_dim[0];
+    auto mat_b_dim = contraction_dim[1];
+    TORCH_CHECK(
+        mat_a.sizes()[mat_a_dim] == mat_b.sizes()[mat_b_dim], "mat_a and mat_b shapes cannot be multiplied (",
+        mat_a.sizes()[0], "x", mat_a.sizes()[1], " and ", mat_b.sizes()[0], "x", mat_b.sizes()[1], ")");
+  } else {
+    // NOTE(slayton): Fix to use contraction dims.
+    TORCH_CHECK(
+        mat_a.sizes()[1] == mat_b.sizes()[0], "mat_a and mat_b shapes cannot be multiplied (",
+        mat_a.sizes()[0], "x", mat_a.sizes()[1], " and ", mat_b.sizes()[0], "x", mat_b.sizes()[1], ")");
+  }
+
   const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
 
@@ -2190,6 +2301,7 @@ _scaled_mm_cuda_v2(
 
   TORCH_CHECK(found_impl, "No suitable scaled gemm implementation found for inputs");
 
+  // dispatch to appropriate lower-level calls for error checking & execution
   if (gemm_impl == ScaledGemmImplementation::TENSORWISE_TENSORWISE) {
     return { _scaled_tensorwise_tensorwise(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype.value_or(at::ScalarType::BFloat16)) };
   } else if (gemm_impl == ScaledGemmImplementation::ROWWISE_ROWWISE) {
