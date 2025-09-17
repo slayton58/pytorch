@@ -34,7 +34,7 @@ def scaled_mm(
     output_dtype: torch.dtype = torch.bfloat16,
     scale_output: List[Tensor] = None,
     scale_recipe_output: List[ScalingType] = None,
-    contraction_dim: List[int] = (-1, -2)):
+    contraction_dim: List[int] = ()) -> Tensor:
 
     def expand_single_value(v):
         if not isinstance(v, (list, tuple)) and v is not None:
@@ -46,6 +46,7 @@ def scaled_mm(
     scale_recipe_a = expand_single_value(scale_recipe_a)
     scale_b = expand_single_value(scale_b)
     scale_recipe_b = expand_single_value(scale_recipe_b)
+
     # native_functions has restrictions on what can be defined
     # & passed through - std::optional<ArrayRef<Tensor>> for instance
     # *cannot* be passed, but an empty vector (list) can.
@@ -56,8 +57,6 @@ def scaled_mm(
 
     def enum_list_as_int_list(l: List):
         return [li.value for li in l]
-
-    print(f'{scale_recipe_a=}')
 
     out = torch._scaled_mm_v2(
             mat_a,
@@ -74,10 +73,4 @@ def scaled_mm(
             enum_list_as_int_list(list_or_empty(scale_recipe_output)),
             contraction_dim)
 
-    # If output is high precision, we'll get a single return.
-    # Otherwise, will get [output, scale0, ... scaleN] for N-level scaling
-    #  - split the latter case into output, [scale0, ..., scaleN]
-    if len(out) == 1:
-        return out
-    else:
-        return out[:1], out[1:]
+    return out
