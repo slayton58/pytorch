@@ -2049,7 +2049,7 @@ _scaled_tensorwise_tensorwise(
   TORCH_CHECK(scale_a.numel() == 1 && scale_a.scalar_type() == kFloat, "scale_a must have 1 Float element")
   TORCH_CHECK(scale_b.numel() == 1 && scale_b.scalar_type() == kFloat, "scale_b must have 1 Float element")
 
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+  //at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
   auto scaling_choice_a = ScalingType::TensorWise;
   auto scaling_choice_b = ScalingType::TensorWise;
@@ -2076,7 +2076,7 @@ _scaled_rowwise_rowwise(
   TORCH_CHECK(scale_a.numel() == mat_a.size(0) && scale_a.scalar_type() == kFloat, "scale_a must have", mat_a.size(0), " Float elements, got ", scale_a.numel())
   TORCH_CHECK(scale_b.numel() == mat_b.size(1) && scale_b.scalar_type() == kFloat, "scale_b must have", mat_b.size(1), " Float elements, got ", scale_b.numel())
 
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+  //at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
   // NVIDIA's cuBLAS only started supporting row-wise scaling in version 12.9,
   // and only for compute capability 9.0+. In other cases we use CUTLASS.
 #ifndef USE_ROCM
@@ -2179,7 +2179,7 @@ _scaled_block128x128_block1x128(
   TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 128 && scale_b.scalar_type() == kFloat,
       "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 128, " Float elements, got ", scale_b.sizes())
 
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+  // at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
   auto scaling_choice_a = ScalingType::BlockWise128x128;
   auto scaling_choice_b = ScalingType::BlockWise1x128;
@@ -2206,7 +2206,7 @@ _scaled_block1x128_block128x128(
   TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] / 128 && scale_b.sizes()[1] == mat_b.sizes()[1] / 128 && scale_b.scalar_type() == kFloat,
       "scale_b must have shape ", mat_b.sizes()[0] / 128, " x ", mat_b.sizes()[1] / 128, " Float elements, got ", scale_b.sizes())
 
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+  // at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
   auto scaling_choice_a = ScalingType::BlockWise1x128;
   auto scaling_choice_b = ScalingType::BlockWise128x128;
@@ -2274,7 +2274,7 @@ _scaled_nvfp4_nvfp4(
 
   TORCH_CHECK(swizzle_a == SwizzleType::SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
   TORCH_CHECK(swizzle_b == SwizzleType::SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+  // at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
   auto scaling_choice_a = ScalingType::BlockWise1x16;
   auto scaling_choice_b = ScalingType::BlockWise1x16;
@@ -2318,15 +2318,20 @@ _scaled_mm_cuda_out_v2(
     return out;
   }
 
+  // Check if the input matrix sizes can be multiplied
+  // - if optional contraction dims are provided, use those
+  //   -- mostly for < 1B formats (i.e. nvfp4x2) where cheap .t() is not available.
   if (contraction_dim.size() > 0) {
     TORCH_CHECK(contraction_dim.size() == 2, "contraction_dim must have exactly 2 elements");
     auto mat_a_dim = contraction_dim[0];
     auto mat_b_dim = contraction_dim[1];
     TORCH_CHECK(
-        mat_a.sizes()[mat_a_dim] == mat_b.sizes()[mat_b_dim], "mat_a and mat_b shapes cannot be multiplied (",
-        mat_a.sizes()[0], "x", mat_a.sizes()[1], " and ", mat_b.sizes()[0], "x", mat_b.sizes()[1], ")");
+        mat_a.size(mat_a_dim) == mat_b.size(mat_b_dim), "mat_a and mat_b shapes cannot be multiplied (",
+        mat_a.size(0), "x", mat_a.size(1), " and ", mat_b.size(0), "x", mat_b.size(1), ") ",
+        "with contraction dims mat_a: ", mat_a_dim, ", mat_b: ", mat_b_dim);
+    // TODO(slayton): Plumb this through.
+    TORCH_CHECK(false, "Matrix shapes multipliable, requires more plumbing");
   } else {
-    // NOTE(slayton): Fix to use contraction dims.
     TORCH_CHECK(
         mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied (",
         mat_a.size(0), "x", mat_a.size(1), " and ", mat_b.size(0), "x", mat_b.size(1), ")");
@@ -2345,12 +2350,65 @@ _scaled_mm_cuda_out_v2(
   TORCH_CHECK(mat_b.sizes()[0] % 16 == 0 && mat_b.sizes()[1] % 16 == 0, "mat2 shape (", mat_b.sizes()[0], "x",
        mat_b.sizes()[1], ") must be divisible by 16");
 
-  std::optional<Tensor> scale_out_;
-  if (scale_output.size() > 0) {
-    scale_out_ = scale_output[0];
-  } else {
-    scale_out_ = std::nullopt;
+  // TODO(slayton): Existing checks, not sure if they should really be here.
+  TORCH_CHECK(!out_dtype || *out_dtype == out.scalar_type(), "out_dtype must match output matrix type");
+  TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) || mat_a.scalar_type() == ScalarType::Float4_e2m1fn_x2, "Expected mat_a to be Float8 or Float4_x2 matrix got ", mat_a.scalar_type());
+  TORCH_CHECK(isFloat8Type(mat_b.scalar_type()) || mat_b.scalar_type() == ScalarType::Float4_e2m1fn_x2, "Expected mat_b to be Float8 or Float4_x2 matrix got ", mat_b.scalar_type());
+#ifndef USE_ROCM
+  // Type restrictions imposed by CuBLASLt as of CUDA-12.1
+  TORCH_CHECK(mat_a.scalar_type() != ScalarType::Float8_e5m2 || mat_b.scalar_type() != ScalarType::Float8_e5m2,
+        "Multiplication of two Float8_e5m2 matrices is not supported");
+#endif
+  if (use_fast_accum) {
+    TORCH_CHECK(mat_a.scalar_type() != ScalarType::Float4_e2m1fn_x2 && mat_b.scalar_type() != ScalarType::Float4_e2m1fn_x2, "`use_fast_accum` is not supported when `mat_a` or `mat_b` tensors have the `Float4_e2m1fn_x2` dtype.");
   }
+#ifdef USE_ROCM
+  if (mat_a.scalar_type() == ScalarType::Float4_e2m1fn_x2 || mat_b.scalar_type() == ScalarType::Float4_e2m1fn_x2) {
+    TORCH_CHECK(ROCM_VERSION >= 70000, "Float4_e2m1fn_x2 is only supported for ROCm 7.0 and above");
+  }
+  if (mat_a.scalar_type() == ScalarType::Float8_e5m2 || mat_b.scalar_type() == ScalarType::Float8_e5m2) {
+    TORCH_CHECK(ROCM_VERSION >= 60500, "Float8_e5m2 is only supported for ROCm 6.5 and above");
+  }
+  if (mat_a.scalar_type() == ScalarType::Float8_e4m3fn || mat_b.scalar_type() == ScalarType::Float8_e4m3fn) {
+    TORCH_CHECK(ROCM_VERSION >= 60500, "Float8_e4m3fn is only supported for ROCm 6.5 and above");
+  }
+#endif
+  if (bias) {
+    TORCH_CHECK(out.scalar_type() != kFloat,
+        "Bias is not supported when out_dtype is set to Float32");
+
+    TORCH_CHECK(bias->scalar_type() == ScalarType::BFloat16 ||
+                bias->scalar_type() == ScalarType::Half,
+        "Bias must be BFloat16 or Half, but got ", bias->scalar_type());
+
+    TORCH_CHECK((out.scalar_type() != kFloat &&
+                 out.scalar_type() != ScalarType::BFloat16) ||
+                bias->scalar_type() == ScalarType::BFloat16,
+        "Bias must be BFloat16 to compute ", out.scalar_type(),
+        " output, but got ", bias->scalar_type());
+
+    TORCH_CHECK(out.scalar_type() != ScalarType::Half ||
+                bias->scalar_type() == ScalarType::Half,
+        "Bias must be Float16 to compute ", out.scalar_type(),
+        " output, but got ", bias->scalar_type());
+  }
+  {
+    auto bias_ = bias.value_or(Tensor());
+    auto scale_result_ = (scale_output.size() > 0) ? scale_output[0] : Tensor(); // scale_result.value_or(Tensor());
+
+    // NOLINTNEXTLINE(*c-array*)
+    TensorArg targs[]{{out, "out", 0}, {mat_a, "mat_a", 1}, {mat_b, "mat_b", 2},
+                      {bias_, "bias", 3}, {scale_a[0], "scale_a", 4}, {scale_b[0], "scale_b", 5},
+                      {scale_result_, "scale_result", 6}};
+    checkAllSameGPU(__func__, targs);
+  }
+
+  // std::optional<Tensor> scale_out_;
+  // if (scale_output.size() > 0) {
+  //   scale_out_ = scale_output[0];
+  // } else {
+  //   scale_out_ = std::nullopt;
+  // }
   auto out_dtype_ = out_dtype.value_or(at::ScalarType::BFloat16);
 
   // Conversion of implicitly-defined enums to explicit
@@ -2416,8 +2474,6 @@ _scaled_mm_cuda_out_v2(
   } else {
     TORCH_CHECK(false, "Invalid state - found implementation, but not actually");
   }
-
-  return  _scaled_mm_out_cuda(mat_a, mat_b, scale_a[0], scale_b[0], scale_out_, bias, out_dtype_, false /* use_fast_accum */, out);
 }
 
 Tensor
