@@ -1886,6 +1886,7 @@ _cutlass_scaled_gemm(
           const Tensor& scale_a, const Tensor& scale_b,
           const ScalingType scaling_choice_a, const ScalingType scaling_choice_b,
           const std::optional<Tensor>& bias,
+          const bool use_fast_accum,
           Tensor& out) {
   cublasCommonArgs args(mat1, mat2, out, scale_a, scale_b, std::nullopt, scaling_choice_a, scaling_choice_b);
   const auto out_dtype_ = args.result->scalar_type();
@@ -2027,7 +2028,7 @@ _cutlass_scaled_gemm(
         args.scale_result_ptr,
         args.result_ld,
         out_dtype_,
-        false /* use_fast_accum */);
+        use_fast_accum);
   }
   return out;
 }
@@ -2038,6 +2039,7 @@ _scaled_tensorwise_tensorwise(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          bool use_fast_accum,
           Tensor& out) {
   // Restrictions:
   // A, B are FP8, scales are fp32
@@ -2052,7 +2054,7 @@ _scaled_tensorwise_tensorwise(
   auto scaling_choice_a = ScalingType::TensorWise;
   auto scaling_choice_b = ScalingType::TensorWise;
 
-  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, use_fast_accum, out);
 
   return out;
 }
@@ -2064,6 +2066,7 @@ _scaled_rowwise_rowwise(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          bool use_fast_accum,
           Tensor& out) {
   // Restrictions:
   // A, B are FP8, scales are fp32, shape M/N for A/B
@@ -2089,7 +2092,7 @@ _scaled_rowwise_rowwise(
         scale_a,
         scale_b,
         bias,
-        false /* use_fast_accum */,
+        use_fast_accum,
         out);
     return out;
   }
@@ -2127,7 +2130,7 @@ _scaled_rowwise_rowwise(
   auto scaling_choice_a = ScalingType::RowWise;
   auto scaling_choice_b = ScalingType::RowWise;
 
-  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, use_fast_accum, out);
 
   return out;
 }
@@ -2138,6 +2141,7 @@ _scaled_block1x128_block1x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          const bool use_fast_accum,
           Tensor& out) {
   // Restrictions:
   // A, B are FP8, scales are fp32, shape K//128
@@ -2153,7 +2157,7 @@ _scaled_block1x128_block1x128(
   auto scaling_choice_a = ScalingType::BlockWise1x128;
   auto scaling_choice_b = ScalingType::BlockWise1x128;
 
-  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, use_fast_accum, out);
 
   return out;
 }
@@ -2164,6 +2168,7 @@ _scaled_block128x128_block1x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          const bool use_fast_accum,
           Tensor& out) {
   // Restrictions:
   // A, B are FP8, scales are fp32, shape K//128
@@ -2179,7 +2184,7 @@ _scaled_block128x128_block1x128(
   auto scaling_choice_a = ScalingType::BlockWise128x128;
   auto scaling_choice_b = ScalingType::BlockWise1x128;
 
-  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, use_fast_accum, out);
 
   return out;
 }
@@ -2190,6 +2195,7 @@ _scaled_block1x128_block128x128(
           const Tensor& scale_a, const Tensor& scale_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          const bool use_fast_accum,
           Tensor& out) {
   // Restrictions:
   // A, B are FP8, scales are fp32, A: shape K//128, B: K//128, N//128
@@ -2205,7 +2211,7 @@ _scaled_block1x128_block128x128(
   auto scaling_choice_a = ScalingType::BlockWise1x128;
   auto scaling_choice_b = ScalingType::BlockWise128x128;
 
-  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, use_fast_accum, out);
 
   return out;
 }
@@ -2240,7 +2246,7 @@ _scaled_mxfp8_mxfp8(
   auto scaling_choice_a = ScalingType::BlockWise1x32;
   auto scaling_choice_b = ScalingType::BlockWise1x32;
 
-  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, false /* use_fast_accum */, out);
 }
 
 Tensor&
@@ -2272,7 +2278,7 @@ _scaled_nvfp4_nvfp4(
 
   auto scaling_choice_a = ScalingType::BlockWise1x16;
   auto scaling_choice_b = ScalingType::BlockWise1x16;
-  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
+  return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, false /* use_fast_accum */, out);
 }
 
 
@@ -2280,16 +2286,17 @@ Tensor&
 _scaled_mm_cuda_out_v2(
           const Tensor& mat_a, const Tensor& mat_b,
           ArrayRef<Tensor> scale_a,
-          ArrayRef<long> scale_recipe_a,
-          ArrayRef<long> swizzle_a,
+          IntArrayRef scale_recipe_a,
+          IntArrayRef swizzle_a,
           ArrayRef<Tensor> scale_b,
-          ArrayRef<long> scale_recipe_b,
-          ArrayRef<long> swizzle_b,
+          IntArrayRef scale_recipe_b,
+          IntArrayRef swizzle_b,
           const std::optional<Tensor>& bias,
           const std::optional<c10::ScalarType> out_dtype,
           ArrayRef<Tensor> scale_output,
-          ArrayRef<long> recipe_output,
-          ArrayRef<long> contraction_dim,
+          IntArrayRef recipe_output,
+          IntArrayRef contraction_dim,
+          bool use_fast_accum,
           Tensor& out) {
   // Check sizes
   bool allowed_device = _scaled_mm_allowed_device();
@@ -2391,15 +2398,15 @@ _scaled_mm_cuda_out_v2(
 
   // dispatch to appropriate lower-level calls for error checking & execution
   if (gemm_impl == ScaledGemmImplementation::TENSORWISE_TENSORWISE) {
-    return _scaled_tensorwise_tensorwise(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, out);
+    return _scaled_tensorwise_tensorwise(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, use_fast_accum, out);
   } else if (gemm_impl == ScaledGemmImplementation::ROWWISE_ROWWISE) {
-    return _scaled_rowwise_rowwise(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, out);
+    return _scaled_rowwise_rowwise(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, use_fast_accum, out);
   } else if (gemm_impl == ScaledGemmImplementation::BLOCK_128x128_1x128) {
-    return _scaled_block128x128_block1x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, out);
+    return _scaled_block128x128_block1x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, use_fast_accum, out);
   } else if (gemm_impl == ScaledGemmImplementation::BLOCK_1x128_128x128) {
-    return _scaled_block1x128_block128x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, out);
+    return _scaled_block1x128_block128x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, use_fast_accum, out);
   } else if (gemm_impl == ScaledGemmImplementation::BLOCK_1x128_1x128) {
-    return _scaled_block1x128_block1x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, out);
+    return _scaled_block1x128_block1x128(mat_a, mat_b, scale_a[0], scale_b[0], bias, out_dtype_, use_fast_accum, out);
   } else if (gemm_impl == ScaledGemmImplementation::MXFP8_MXFP8) {
     return _scaled_mxfp8_mxfp8(mat_a, mat_b, scale_a[0], swizzle_a_enum[0], scale_b[0], swizzle_b_enum[0], bias, out_dtype_, out);
   } else if (gemm_impl == ScaledGemmImplementation::NVFP4_NVFP4) {
@@ -2417,16 +2424,17 @@ Tensor
 _scaled_mm_cuda_v2(
           const Tensor& mat_a, const Tensor& mat_b,
           ArrayRef<Tensor> scale_a,
-          ArrayRef<long> scale_recipe_a,
-          ArrayRef<long> swizzle_a,
+          IntArrayRef scale_recipe_a,
+          IntArrayRef swizzle_a,
           ArrayRef<Tensor> scale_b,
-          ArrayRef<long> scale_recipe_b,
-          ArrayRef<long> swizzle_b,
+          IntArrayRef scale_recipe_b,
+          IntArrayRef swizzle_b,
           const std::optional<Tensor>& bias,
           const std::optional<c10::ScalarType> out_dtype,
           ArrayRef<Tensor> scale_output,
-          ArrayRef<long> recipe_output,
-          ArrayRef<long> contraction_dim) {
+          IntArrayRef recipe_output,
+          IntArrayRef contraction_dim,
+          bool use_fast_accum) {
   const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
 
@@ -2439,6 +2447,7 @@ _scaled_mm_cuda_v2(
                       scale_output,
                       recipe_output,
                       contraction_dim,
+                      use_fast_accum,
                       out);
 }
 

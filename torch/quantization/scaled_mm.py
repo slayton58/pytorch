@@ -34,7 +34,8 @@ def scaled_mm(
     output_dtype: torch.dtype = torch.bfloat16,
     scale_output: Tensor | List[Tensor] = None,
     scale_recipe_output: ScalingType | List[ScalingType] = None,
-    contraction_dim: List[int] = ()) -> Tensor:
+    contraction_dim: List[int] = (),
+    use_fast_accum: bool = False) -> Tensor:
 
     def expand_single_value(v):
         if not isinstance(v, (list, tuple)) and v is not None:
@@ -73,6 +74,7 @@ def scaled_mm(
             output_dtype,
             list_or_empty(scale_output),
             enum_list_as_int_list(list_or_empty(scale_recipe_output)),
-            contraction_dim)
+            contraction_dim,
+            use_fast_accum)
 
     return out
