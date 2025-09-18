@@ -1668,6 +1668,7 @@ enum class ScaledGemmImplementation {
   BLOCK_1x128_1x128 = 5,
   MXFP8_MXFP8 = 6,
   NVFP4_NVFP4 = 7,
+  NVFP4_NVFP4_SINGLE_SCALE = 8,
 };
 
 /**
@@ -1695,7 +1696,7 @@ bool check_tensorwise_recipe(c10::ScalarType type_a,
                              std::vector<ScalingType>& recipe_b,
                              ArrayRef<Tensor>& scales_b) {
   // both types must be fp8
-  if (type_a != ScalarType::Float8_e4m3fn || type_b != ScalarType::Float8_e4m3fn) {
+  if (!isFloat8Type(type_a) || !isFloat8Type(type_b)) {
     return false;
   }
 
@@ -1723,7 +1724,7 @@ bool check_rowwise_recipe(c10::ScalarType type_a,
                              std::vector<ScalingType>& recipe_b,
                              ArrayRef<Tensor>& scales_b) {
   // both types must be fp8
-  if (type_a != ScalarType::Float8_e4m3fn || type_b != ScalarType::Float8_e4m3fn) {
+  if (!isFloat8Type(type_a) || !isFloat8Type(type_b)) {
     return false;
   }
 
@@ -1732,7 +1733,7 @@ bool check_rowwise_recipe(c10::ScalarType type_a,
     return false;
   }
 
-  // Need {Blockwise_1x32, e8m0} for A & B
+  // Need {RowWise, dp32} for A & B
   if (recipe_a[0] != ScalingType::RowWise) return false;
   if (scales_a[0].scalar_type() != ScalarType::Float) return false;
   if (recipe_b[0] != ScalingType::RowWise) return false;
@@ -1743,6 +1744,7 @@ bool check_rowwise_recipe(c10::ScalarType type_a,
 
 
 /**
+ * Two-level scaling, canonical NVFP4
  * Both inputs must be fp4
  * A, B need 2 scales, {Blockwise_1x16 (e4m3), Tensorwise (fp32)}
  */
@@ -1767,6 +1769,37 @@ bool check_nvfp4_recipe(c10::ScalarType type_a,
   if (scales_a[0].scalar_type() != ScalarType::Float8_e4m3fn || scales_a[1].scalar_type() != ScalarType::Float) return false;
   if (recipe_b[0] != ScalingType::BlockWise1x16 || recipe_b[1] != ScalingType::TensorWise) return false;
   if (scales_b[0].scalar_type() != ScalarType::Float8_e4m3fn || scales_b[1].scalar_type() != ScalarType::Float) return false;
+
+  return true;
+}
+
+/**
+ * Single-level scaling, what PyT currently understands
+ * Both inputs must be fp4
+ * A, B need 1 scale, {Blockwise_1x16 (e4m3)}
+ */
+bool check_nvfp4_recipe_single_scale
+                       (c10::ScalarType type_a,
+                        std::vector<ScalingType>& recipe_a,
+                        ArrayRef<Tensor>& scales_a,
+                        c10::ScalarType type_b,
+                        std::vector<ScalingType>& recipe_b,
+                        ArrayRef<Tensor>& scales_b) {
+  // both types must be fp4
+  if (type_a != ScalarType::Float4_e2m1fn_x2 || type_b != ScalarType::Float4_e2m1fn_x2) {
+    return false;
+  }
+
+  // 2 scales, 2 recipes for each input
+  if (scales_a.size() != 1 || recipe_a.size() != 1 || scales_b.size() != 1 || recipe_b.size() != 1) {
+    return false;
+  }
+
+  // Need {Blockwise_1x16, e4m3 for scale[0], Tensorwise, fp32 for scale[1]}
+  if (recipe_a[0] != ScalingType::BlockWise1x16) return false;
+  if (scales_a[0].scalar_type() != ScalarType::Float8_e4m3fn) return false;
+  if (recipe_b[0] != ScalingType::BlockWise1x16) return false;
+  if (scales_b[0].scalar_type() != ScalarType::Float8_e4m3fn) return false;
 
   return true;
 }
@@ -1844,6 +1877,7 @@ std::vector<std::tuple<std::string, acceptance_fn, ScaledGemmImplementation>> sc
   { "block_1x128_1x128", std::bind(check_deepseek_recipe, ScalingType::BlockWise1x128, ScalingType::BlockWise1x128, _1, _2, _3, _4, _5, _6),
     ScaledGemmImplementation::BLOCK_1x128_1x128},
   { "nvfp4", check_nvfp4_recipe, ScaledGemmImplementation::NVFP4_NVFP4},
+  { "nvfp4_single_scale", check_nvfp4_recipe_single_scale, ScaledGemmImplementation::NVFP4_NVFP4_SINGLE_SCALE },
   { "mxfp8", check_mxfp8_recipe, ScaledGemmImplementation::MXFP8_MXFP8}};
 
 Tensor&
@@ -2216,7 +2250,9 @@ _scaled_nvfp4_nvfp4(
           const Tensor& scale_b, const SwizzleType swizzle_b,
           const std::optional<Tensor>& bias,
           const c10::ScalarType out_dtype,
+          const bool single_scale,
           Tensor& out) {
+  TORCH_CHECK(single_scale, "Only single-scaled NVFP4 currently supported");
   // Restrictions:
   // A, B are FP4, scales are e8m0, A: shape K//32, B: K, N//32
   // Scales must be swizzled
@@ -2226,15 +2262,16 @@ _scaled_nvfp4_nvfp4(
   //     "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 32, " Float elements, got ", scale_a.sizes())
   // TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 16 && scale_b.scalar_type() == kFloat8_e4m3fn,
   //     "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 32, " Float elements, got ", scale_b.sizes())
-  TORCH_CHECK(round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1), 32), 4) == scale_a.numel());
-  TORCH_CHECK(round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0), 32), 4) == scale_b.numel());
+  // Note: fp4x2 format, need to double the K dimension for checking purposes.
+  TORCH_CHECK(round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1) * 2, 16), 4) == scale_a.numel());
+  TORCH_CHECK(round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0) * 2, 16), 4) == scale_b.numel());
 
   TORCH_CHECK(swizzle_a == SwizzleType::SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
   TORCH_CHECK(swizzle_b == SwizzleType::SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
   at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
-  auto scaling_choice_a = ScalingType::BlockWise1x32;
-  auto scaling_choice_b = ScalingType::BlockWise1x32;
+  auto scaling_choice_a = ScalingType::BlockWise1x16;
+  auto scaling_choice_b = ScalingType::BlockWise1x16;
   return _cutlass_scaled_gemm(mat_a, mat_b, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, out);
 }
 
@@ -2260,6 +2297,20 @@ _scaled_mm_cuda_out_v2(
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a matrix");
   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be a matrix");
 
+  // If any of M, K, N is 0 - return early (the tensorwise/rowwise float8 gemm kernels
+  // do not support this case).
+  if (mat_a.size(0) == 0 || mat_a.size(1) == 0 || mat_b.size(1) == 0) {
+    // `out` was created with `at::empty`. In the case where we are multiplying
+    // MxK by KxN and K is the zero dim, we need to initialize here to properly
+    // return a tensor of zeros.
+    at::native::resize_output(out, {mat_a.size(0), mat_b.size(1)});
+    if (mat_a.size(1) == 0) {
+      out.zero_();
+    }
+
+    return out;
+  }
+
   if (contraction_dim.size() > 0) {
     TORCH_CHECK(contraction_dim.size() == 2, "contraction_dim must have exactly 2 elements");
     auto mat_a_dim = contraction_dim[0];
@@ -2273,6 +2324,19 @@ _scaled_mm_cuda_out_v2(
         mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied (",
         mat_a.size(0), "x", mat_a.size(1), " and ", mat_b.size(0), "x", mat_b.size(1), ")");
   }
+
+  TORCH_CHECK(!bias || bias->numel() == mat_b.sizes()[1], "Bias must be size ", mat_b.sizes()[1],
+       " but got ", bias->numel());
+  TORCH_CHECK(
+      mat_a.sizes()[1] % 16 == 0,
+      "Expected trailing dimension of mat1 to be divisible by 16 ",
+      "but got mat1 shape: (",
+      mat_a.sizes()[0],
+      "x",
+      mat_a.sizes()[1],
+      ").");
+  TORCH_CHECK(mat_b.sizes()[0] % 16 == 0 && mat_b.sizes()[1] % 16 == 0, "mat2 shape (", mat_b.sizes()[0], "x",
+       mat_b.sizes()[1], ") must be divisible by 16");
 
   std::optional<Tensor> scale_out_;
   if (scale_output.size() > 0) {
@@ -2339,12 +2403,14 @@ _scaled_mm_cuda_out_v2(
   } else if (gemm_impl == ScaledGemmImplementation::MXFP8_MXFP8) {
     return _scaled_mxfp8_mxfp8(mat_a, mat_b, scale_a[0], swizzle_a_enum[0], scale_b[0], swizzle_b_enum[0], bias, out_dtype_, out);
   } else if (gemm_impl == ScaledGemmImplementation::NVFP4_NVFP4) {
-    // return _scaled_nvfp4_nvfp4(mat_a, mat_b, scale_a[0], scale_a[1], swizzle_a[0], scale_b[0], scale_b[1], swizzle_b[0], bias, out_dtype_, out);
+    TORCH_CHECK(false, "Only single-scale NVFP4 currently supported");
+  } else if (gemm_impl == ScaledGemmImplementation::NVFP4_NVFP4_SINGLE_SCALE) {
+    return _scaled_nvfp4_nvfp4(mat_a, mat_b, scale_a[0], swizzle_a_enum[0], scale_b[0], swizzle_b_enum[0], bias, out_dtype_, true /* single_scale */, out);
   } else {
     TORCH_CHECK(false, "Invalid state - found implementation, but not actually");
   }
 
-  return  _scaled_mm_out_cuda(mat_a, mat_b, scale_a[0], scale_b[0], bias, scale_out_, out_dtype_, false /* use_fast_accum */, out);
+  return  _scaled_mm_out_cuda(mat_a, mat_b, scale_a[0], scale_b[0], scale_out_, bias, out_dtype_, false /* use_fast_accum */, out);
 }
 
 Tensor

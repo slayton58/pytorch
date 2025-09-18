@@ -24,16 +24,16 @@ class SwizzleType(Enum):
 def scaled_mm(
     mat_a: Tensor,
     mat_b: Tensor,
-    scale_a: List[Tensor],
-    scale_recipe_a: List[ScalingType],
-    scale_b: List[Tensor],
-    scale_recipe_b: List[ScalingType],
-    swizzle_a: List[SwizzleType] = None,
-    swizzle_b: List[SwizzleType] = None,
+    scale_a: Tensor | List[Tensor],
+    scale_recipe_a: ScalingType | List[ScalingType],
+    scale_b: Tensor | List[Tensor],
+    scale_recipe_b: ScalingType | List[ScalingType],
+    swizzle_a: SwizzleType | List[SwizzleType] = None,
+    swizzle_b: SwizzleType | List[SwizzleType] = None,
     bias: Tensor = None,
     output_dtype: torch.dtype = torch.bfloat16,
-    scale_output: List[Tensor] = None,
-    scale_recipe_output: List[ScalingType] = None,
+    scale_output: Tensor | List[Tensor] = None,
+    scale_recipe_output: ScalingType | List[ScalingType] = None,
     contraction_dim: List[int] = ()) -> Tensor:
 
     def expand_single_value(v):
@@ -46,6 +46,8 @@ def scaled_mm(
     scale_recipe_a = expand_single_value(scale_recipe_a)
     scale_b = expand_single_value(scale_b)
     scale_recipe_b = expand_single_value(scale_recipe_b)
+    swizzle_a = expand_single_value(swizzle_a)
+    swizzle_b = expand_single_value(swizzle_b)
 
     # native_functions has restrictions on what can be defined
     # & passed through - std::optional<ArrayRef<Tensor>> for instance
