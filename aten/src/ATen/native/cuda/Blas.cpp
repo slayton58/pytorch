@@ -2327,8 +2327,6 @@ _scaled_mm_cuda_v2_out(
         mat_a.size(mat_a_dim) == mat_b.size(mat_b_dim), "mat_a and mat_b shapes cannot be multiplied (",
         mat_a.size(0), "x", mat_a.size(1), " and ", mat_b.size(0), "x", mat_b.size(1), ") ",
         "with contraction dims mat_a: ", mat_a_dim, ", mat_b: ", mat_b_dim);
-    // TODO(slayton): Plumb this through.
-    TORCH_CHECK(false, "Matrix shapes multipliable, requires more plumbing");
   } else {
     TORCH_CHECK(
         mat_a.size(1) == mat_b.size(0), "mat_a and mat_b shapes cannot be multiplied (",
@@ -2446,6 +2444,8 @@ _scaled_mm_cuda_v2_out(
     "Got mat_a.dtype()=", mat_a.scalar_type(), ", scale_a[0].dtype()=", scale_a[0].scalar_type(), ", scale_a[0].size()=", scale_a[0].sizes(), ", scale_a[0].stride()=", scale_a[0].strides(), ", ",
     "mat_b.dtype()=", mat_b.scalar_type(), ", scale_b[0].dtype()=", scale_b[0].scalar_type(), ", scale_b[0].size()=", scale_b[0].sizes(), " and scale_b[0].stride()=", scale_b[0].strides()
   );
+
+  at::native::resize_output(out, {mat_a.size(0), mat_b.size(1)});
 
   auto bias_ = bias.value_or(Tensor());
 
