@@ -2283,7 +2283,7 @@ _scaled_nvfp4_nvfp4(
 
 
 Tensor&
-_scaled_mm_cuda_out_v2(
+_scaled_mm_cuda_v2_out(
           const Tensor& mat_a, const Tensor& mat_b,
           ArrayRef<Tensor> scale_a,
           IntArrayRef scale_recipe_a,
@@ -2293,8 +2293,6 @@ _scaled_mm_cuda_out_v2(
           IntArrayRef swizzle_b,
           const std::optional<Tensor>& bias,
           const std::optional<c10::ScalarType> out_dtype,
-          ArrayRef<Tensor> scale_output,
-          IntArrayRef recipe_output,
           IntArrayRef contraction_dim,
           bool use_fast_accum,
           Tensor& out) {
@@ -2394,12 +2392,10 @@ _scaled_mm_cuda_out_v2(
   }
   {
     auto bias_ = bias.value_or(Tensor());
-    auto scale_result_ = (scale_output.size() > 0) ? scale_output[0] : Tensor(); // scale_result.value_or(Tensor());
 
     // NOLINTNEXTLINE(*c-array*)
     TensorArg targs[]{{out, "out", 0}, {mat_a, "mat_a", 1}, {mat_b, "mat_b", 2},
-                      {bias_, "bias", 3}, {scale_a[0], "scale_a", 4}, {scale_b[0], "scale_b", 5},
-                      {scale_result_, "scale_result", 6}};
+                      {bias_, "bias", 3}, {scale_a[0], "scale_a", 4}, {scale_b[0], "scale_b", 5}};
     checkAllSameGPU(__func__, targs);
   }
 
@@ -2416,7 +2412,6 @@ _scaled_mm_cuda_out_v2(
   auto swizzle_a_enum = convert_int_to_enum<SwizzleType>(swizzle_a);
   auto scale_recipe_b_enum = convert_int_to_enum<ScalingType>(scale_recipe_b);
   auto swizzle_b_enum = convert_int_to_enum<SwizzleType>(swizzle_b);
-  auto recipe_output_enum = convert_int_to_enum<ScalingType>(recipe_output);
 
   // at this point we can start working out what we want to be doing
   // Try to do as few steps as possible.
@@ -2487,21 +2482,17 @@ _scaled_mm_cuda_v2(
           IntArrayRef swizzle_b,
           const std::optional<Tensor>& bias,
           const std::optional<c10::ScalarType> out_dtype,
-          ArrayRef<Tensor> scale_output,
-          IntArrayRef recipe_output,
           IntArrayRef contraction_dim,
           bool use_fast_accum) {
   const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
   Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
 
-  return _scaled_mm_cuda_out_v2(
+  return _scaled_mm_cuda_v2_out(
                       mat_a, mat_b,
                       scale_a, scale_recipe_a, swizzle_a,
                       scale_b, scale_recipe_b, swizzle_b,
                       bias,
                       out_dtype,
-                      scale_output,
-                      recipe_output,
                       contraction_dim,
                       use_fast_accum,
                       out);
