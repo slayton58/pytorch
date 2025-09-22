@@ -2073,8 +2073,8 @@ _scaled_rowwise_rowwise(
   TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
       mat_a.scalar_type(), mat_b.scalar_type());
   TORCH_CHECK(scale_a.size(0) == mat_a.size(0) && scale_a.size(1) == 1, "scale_a must have shape [", mat_a.size(0), ", 1], got [", scale_a.sizes(), "]");
-  TORCH_CHECK(scale_a.numel() == mat_a.size(0) && scale_a.scalar_type() == kFloat, "scale_a must have", mat_a.size(0), " Float elements, got ", scale_a.numel())
-  TORCH_CHECK(scale_b.numel() == mat_b.size(1) && scale_b.scalar_type() == kFloat, "scale_b must have", mat_b.size(1), " Float elements, got ", scale_b.numel())
+  TORCH_CHECK(scale_a.numel() == mat_a.size(0) && scale_a.scalar_type() == kFloat, "scale_a must have ", mat_a.size(0), " Float elements, got ", scale_a.numel())
+  TORCH_CHECK(scale_b.numel() == mat_b.size(1) && scale_b.scalar_type() == kFloat, "scale_b must have ", mat_b.size(1), " Float elements, got ", scale_b.numel())
 
   //at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
   // NVIDIA's cuBLAS only started supporting row-wise scaling in version 12.9,
@@ -2229,19 +2229,21 @@ _scaled_mxfp8_mxfp8(
   // Scales must be swizzled
   TORCH_CHECK(isFloat8Type(mat_a.scalar_type()) && isFloat8Type(mat_b.scalar_type()), "mat_a and mat_b must be fp8 types, got: ",
       mat_a.scalar_type(), mat_b.scalar_type());
-  // TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 32 && scale_a.scalar_type() == kFloat8_e8m0fnu,
-  //     "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 32, " Float elements, got ", scale_a.sizes())
-  // TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 32 && scale_b.scalar_type() == kFloat8_e8m0fnu,
-  //     "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 32, " Float elements, got ", scale_b.sizes())
 
-  TORCH_CHECK(round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1), 32), 4) == scale_a.numel());
-  TORCH_CHECK(round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0), 32), 4) == scale_b.numel());
+  auto scale_a_elems = round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1), 32), 4);
+  auto scale_b_elems = round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0), 32), 4);
+  TORCH_CHECK(scale_a_elems == scale_a.numel(),
+         "For Blockwise scaling scale_a should have ", scale_a_elems, " elements, got: ", scale_a.numel());
+  TORCH_CHECK(scale_b_elems == scale_b.numel(),
+         "For Blockwise scaling scale_b should have ", scale_b_elems, " elements, got: ", scale_b.numel());
 
   TORCH_CHECK(swizzle_a == SwizzleType::SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
   TORCH_CHECK(swizzle_b == SwizzleType::SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
 
+  TORCH_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous(),
+        "For Blockwise scaling both scales should be contiguous");
+
   TORCH_CHECK(out.scalar_type() == out_dtype);
-  at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
 
   auto scaling_choice_a = ScalingType::BlockWise1x32;
   auto scaling_choice_b = ScalingType::BlockWise1x32;
@@ -2264,17 +2266,19 @@ _scaled_nvfp4_nvfp4(
   // Scales must be swizzled
   TORCH_CHECK(mat_a.scalar_type() == at::kFloat4_e2m1fn_x2 && mat_b.scalar_type() == at::kFloat4_e2m1fn_x2, "mat_a and mat_b must be fp4 types, got: ",
       mat_a.scalar_type(), mat_b.scalar_type());
-  // TORCH_CHECK(scale_a.sizes()[0] == mat_a.sizes()[0] && scale_a.sizes()[1] == mat_a.sizes()[1] / 16 && scale_a.scalar_type() == kFloat8_e4m3fn,
-  //     "scale_a must have shape ", mat_a.sizes()[0], " x ", mat_a.sizes()[1] / 32, " Float elements, got ", scale_a.sizes())
-  // TORCH_CHECK(scale_b.sizes()[0] == mat_b.sizes()[0] && scale_b.sizes()[1] == mat_b.sizes()[1] / 16 && scale_b.scalar_type() == kFloat8_e4m3fn,
-  //     "scale_b must have shape ", mat_b.sizes()[0], " x ", mat_b.sizes()[1] / 32, " Float elements, got ", scale_b.sizes())
   // Note: fp4x2 format, need to double the K dimension for checking purposes.
-  TORCH_CHECK(round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1) * 2, 16), 4) == scale_a.numel());
-  TORCH_CHECK(round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0) * 2, 16), 4) == scale_b.numel());
+  auto scale_a_elems = round_up<int64_t>(mat_a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_a.size(1) * 2, 16), 4);
+  auto scale_b_elems = round_up<int64_t>(mat_b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(mat_b.size(0) * 2, 16), 4);
+  TORCH_CHECK(scale_a_elems == scale_a.numel(),
+         "For Blockwise scaling scale_a should have ", scale_a_elems, " elements, got: ", scale_a.numel());
+  TORCH_CHECK(scale_b_elems == scale_b.numel(),
+         "For Blockwise scaling scale_b should have ", scale_b_elems, " elements, got: ", scale_b.numel());
 
   TORCH_CHECK(swizzle_a == SwizzleType::SWIZZLE_32_4_4, "scale_a must be swizzled to SWIZZLE_32_4_4 format");
   TORCH_CHECK(swizzle_b == SwizzleType::SWIZZLE_32_4_4, "scale_b must be swizzled to SWIZZLE_32_4_4 format");
-  // at::native::resize_output(out, {mat_a.sizes()[0], mat_b.sizes()[1]});
+
+  TORCH_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous(),
+        "For Blockwise scaling both scales should be contiguous");
 
   auto scaling_choice_a = ScalingType::BlockWise1x16;
   auto scaling_choice_b = ScalingType::BlockWise1x16;
