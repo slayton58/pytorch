@@ -135,7 +135,7 @@ def infer_scale_swizzle(mat, scale):
             or scale.shape[1] == mat.shape[1]
             and scale.shape[0] == math.ceil(mat.shape[0] // 128)
         ):
-            return ScalingType.Blockwise_128x128, SwizzleType.NoSwizzle
+            return ScalingType.Blockwise_1x128, SwizzleType.NoSwizzle
 
         # deepgemm 128x128
         if scale.shape[0] == math.ceil(mat.shape[0] // 128) and scale.shape[
@@ -168,7 +168,6 @@ def infer_scale_swizzle(mat, scale):
 
 
 wrap: bool = True
-
 
 def scaled_mm_wrap(
     a,
@@ -617,6 +616,7 @@ class TestFP8Matmul(TestCase):
 
         x_scale = tensor_to_scale(x, input_dtype).float()
         y_scale = tensor_to_scale(y, input_dtype).float()
+
 
         x_fp8 = to_fp8_saturated(x * x_scale, input_dtype)
         y_fp8 = to_fp8_saturated(y * y_scale, input_dtype)
