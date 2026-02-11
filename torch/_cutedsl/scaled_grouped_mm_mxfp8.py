@@ -3,11 +3,12 @@ from collections.abc import Sequence
 from typing import NamedTuple, Optional
 
 import torch
-from torch import Tensor
+from torch import library, Tensor
 from torch._cutedsl._compile_with_safe_names import _compile_with_safe_names
 from torch._cutedsl.scaled_grouped_mm_prepare_metadata import (
     _compile_scaled_grouped_mm_prepare_metadata,
 )
+from torch.library import Library
 from torch.nn.functional import ScalingType, SwizzleType
 
 
@@ -274,21 +275,21 @@ def _get_tensormap(sm_count: int, device: torch.device) -> Tensor:
     )
     return _alloc_tensormap(device_index, sm_count)
 
-
+# @library.custom_op("cutedsl::scaled_grouped_mm_mxfp8", mutates_args={}, device_types="cuda")
 def scaled_grouped_mm_mxfp8(
     mat_a: Tensor,
     mat_b: Tensor,
     scale_a: list[Tensor],
+    scale_recipe_a: list[int],
+    swizzle_a: list[int],
     scale_b: list[Tensor],
-    scale_recipe_a: list[ScalingType],
-    scale_recipe_b: list[ScalingType],
-    swizzle_a: list[SwizzleType],
-    swizzle_b: list[SwizzleType],
+    scale_recipe_b: list[int],
+    swizzle_b: list[int],
     offs: Optional[Tensor],
-    output_dtype: Optional[torch.dtype] = None,
-    contraction_dim: Sequence[int] = (),
-    use_fast_accum: bool = False,
     bias: Optional[Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+    contraction_dim: list[int] | None = None,
+    use_fast_accum: bool = False,
 ) -> Tensor:
     if mat_a.size(-1) % 32 != 0:
         raise ValueError("K dimension must be divisible by 32 for MXFP8 block scaling")
@@ -338,15 +339,16 @@ def scaled_grouped_mm_mxfp8(
         raise ValueError("offs size must match mat_b batch dimension")
     if len(scale_recipe_a) != 1 or len(scale_recipe_b) != 1:
         raise ValueError("scale_recipe_a and scale_recipe_b must be singleton lists")
-    if scale_recipe_a[0] != ScalingType.BlockWise1x32:
+    # Note: C++ has bare ints instead of enums (limitation of native_functions), so convertt back
+    if ScalingType(scale_recipe_a[0]) != ScalingType.BlockWise1x32:
         raise ValueError("scale_recipe_a must be BlockWise1x32 for MXFP8")
-    if scale_recipe_b[0] != ScalingType.BlockWise1x32:
+    if ScalingType(scale_recipe_b[0]) != ScalingType.BlockWise1x32:
         raise ValueError("scale_recipe_b must be BlockWise1x32 for MXFP8")
     if len(swizzle_a) != 1 or len(swizzle_b) != 1:
         raise ValueError("swizzle_a and swizzle_b must be singleton lists")
-    if swizzle_a[0] != SwizzleType.SWIZZLE_32_4_4:
+    if SwizzleType(swizzle_a[0]) != SwizzleType.SWIZZLE_32_4_4:
         raise ValueError("swizzle_a must be SWIZZLE_32_4_4 for MXFP8")
-    if swizzle_b[0] != SwizzleType.SWIZZLE_32_4_4:
+    if SwizzleType(swizzle_b[0]) != SwizzleType.SWIZZLE_32_4_4:
         raise ValueError("swizzle_b must be SWIZZLE_32_4_4 for MXFP8")
 
     _check_scales_blocked(mat_a, scale_a[0], 0)
@@ -476,4 +478,31 @@ def scaled_grouped_mm_mxfp8(
     return out
 
 
-__all__ = ["scaled_grouped_mm_mxfp8"]
+nn_lib = None
+
+def _scaled_grouped_mm_mxfp8_register_kernels() -> Library:
+    global nn_lib
+
+    if nn_lib is not None:
+        return nn_lib
+
+    nn_lib = Library("aten", "IMPL", "CUDA")
+
+    # original version
+    kernel = torch.library.get_kernel("aten::_scaled_grouped_mm_v2", "CUDA")
+
+    def conditional_dispatch(dispatch_keys, a, b, scale_a, scale_b, *args, **kwargs):
+        # If we want to use the cuteDSL kernel
+        # TODO: Strengthen this check
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.dtype == torch.float8_e4m3fn:
+            import torch._dynamo as torch_dynamo
+            return torch_dynamo.disable(scaled_grouped_mm_mxfp8)(a, b, scale_a, scale_b, *args, **kwargs)
+            # return scaled_grouped_mm_mxfp8(a, b, scale_a, scale_b, *args, **kwargs)
+        else:
+            # Otherwise just dispatch to original call
+            return kernel.call_boxed(dispatch_keys, a, b, scale_a, scale_b, *args, **kwargs)
+
+    nn_lib.impl("_scaled_grouped_mm_v2", conditional_dispatch, "CUDA", with_keyset=True)
+
+
+__all__ = ["scaled_grouped_mm_mxfp8", "_scaled_grouped_mm_mxfp8_register_kernel"]

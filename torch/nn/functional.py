@@ -30,6 +30,8 @@ from torch.overrides import (
     has_torch_function_unary,
     has_torch_function_variadic,
 )
+from torch._cutedsl import scaled_grouped_mm_mxfp8, scaled_grouped_mm_mxfp8_register_kernels
+
 
 
 # Set visibility of the bound enums to this module
@@ -6880,41 +6882,43 @@ def scaled_grouped_mm(
 
     # Symbolic FX tracing passes Proxy placeholders (not Tensor), so gate this
     # dtype/device branch to real Tensor inputs only.
-    if isinstance(mat_a, Tensor) and mat_a.dtype == torch.float8_e4m3fn:
-        try:
-            major, _ = torch.cuda.get_device_capability(mat_a.device)
-        except Exception:
-            major = -1
-        if major == 10 and mat_a.dim() == 2 and mat_b.dim() == 3:
-            from torch._cutedsl import scaled_grouped_mm_mxfp8
+    # if isinstance(mat_a, Tensor) and mat_a.dtype == torch.float8_e4m3fn:
+    #     try:
+    #         major, _ = torch.cuda.get_device_capability(mat_a.device)
+    #     except Exception:
+    #         major = -1
+    #     if major == 10 and mat_a.dim() == 2 and mat_b.dim() == 3:
+    #         from torch._cutedsl import scaled_grouped_mm_mxfp8
 
-            # Temporary bridge until an inductor lowering exists: run the
-            # CuTeDSL path eagerly under torch.compile.
-            if torch.compiler.is_compiling():
-                import torch._dynamo as torch_dynamo
+    #         # Temporary bridge until an inductor lowering exists: run the
+    #         # CuTeDSL path eagerly under torch.compile.
+    #         if torch.compiler.is_compiling():
+    #             import torch._dynamo as torch_dynamo
 
-                # TODO: remove this graph-break bridge once scaled_grouped_mm
-                # is fully CuTeDSL-backed and has a proper compile-time lowering
-                # (or custom op lowering) in the compiler stack.
-                cutedsl_call = torch_dynamo.disable(scaled_grouped_mm_mxfp8)
-            else:
-                cutedsl_call = scaled_grouped_mm_mxfp8
+    #             # TODO: remove this graph-break bridge once scaled_grouped_mm
+    #             # is fully CuTeDSL-backed and has a proper compile-time lowering
+    #             # (or custom op lowering) in the compiler stack.
+    #             cutedsl_call = torch_dynamo.disable(scaled_grouped_mm_mxfp8)
+    #         else:
+    #             print('using cutedsl')
+    #             cutedsl_call = scaled_grouped_mm_mxfp8
 
-            return cutedsl_call(
-                mat_a,
-                mat_b,
-                scale_a,
-                scale_b,
-                scale_recipe_a,
-                scale_recipe_b,
-                swizzle_a,
-                swizzle_b,
-                offs,
-                output_dtype,
-                contraction_dim,
-                use_fast_accum,
-                bias=bias,
-            )
+    #         return cutedsl_call(
+    #             mat_a,
+    #             mat_b,
+    #             scale_a,
+    #             scale_b,
+    #             scale_recipe_a,
+    #             scale_recipe_b,
+    #             swizzle_a,
+    #             swizzle_b,
+    #             offs,
+    #             output_dtype,
+    #             contraction_dim,
+    #             use_fast_accum,
+    #             bias=bias,
+    #         )
+    scaled_grouped_mm_mxfp8_register_kernels()
 
     # native_functions has restrictions on what can be defined
     # & passed through - std::optional<ArrayRef<Tensor>> for instance
