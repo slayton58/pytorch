@@ -1,0 +1,5 @@
+from ...registry import register_op_registerer
+
+from .scaled_grouped_mm_mxfp8 import scaled_grouped_mm_mxfp8_register_kernels
+
+register_op_registerer(scaled_grouped_mm_mxfp8_register_kernels)
