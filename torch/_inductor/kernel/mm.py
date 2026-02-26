@@ -899,7 +899,17 @@ def tuned_scaled_mm_v2(
     name = "scaled_mm_v2"
     check_supported_striding(mat_a, mat_b)
 
-    scale_a_real, scale_b_real = realize_inputs(scale_a, scale_b)
+    is_single_level_scale = len(scale_a) == 1 and len(scale_b) == 1
+
+    def check_supported_recipe(recipe):
+        disallowed = [ScalingType.BlockWise1x16, ScalingType.BlockWise1x32]
+
+        return not (recipe in disallowed)
+
+    supported_recipe = check_supported_recipe(recipe_a) and check_supported_recipe(recipe_b)
+
+    # Only handle single-level scales (no MX/NV)
+    scale_a_real, scale_b_real = realize_inputs(scale_a[0], scale_b[0])
 
     input_nodes: list[Any]
 
@@ -930,26 +940,27 @@ def tuned_scaled_mm_v2(
 
     if (
         # We dont have triton lowerings for the MX variants yet
-        scale_a.dtype == torch.float32
+        is_single_level_scale
+        and supported_recipe
+        and scale_a[0].dtype == torch.float32
         and is_nonzero
         and use_triton_template(layout, enable_float8=True, check_max_autotune=False)
     ):
+        print('scaled_mm_v2 creating')
         overriders = dict(USE_FAST_ACCUM=use_fast_accum)
 
         scale_a_size, scale_b_size = scale_a_real.shape, scale_b_real.shape
 
         # Note: No NVFP4 support at this point - can ignore swizzling, and take only the
         #       first scale types passed.
-        scale_option_a, scale_option_b = recipe_a[0], recipe_b[0]
-        # scale_option_a, scale_option_b = get_scaling_options(
-        #     mat_a, mat_b, scale_a_size, scale_b_size
-        # )
+        scale_option_a, scale_option_b = ScalingType(recipe_a[0]), ScalingType(recipe_b[0])
 
+        print(f'{scale_option_a=}, {scale_option_b=}')
         # TODO (paulzhan): There is no template that exists for bias and TMA
         # Don't run tma template currently if bias exist
         if use_triton_tma_template(mat_a, mat_b, output_layout=layout) and not bias:
-            overriders["SCALE_RECIPE_A"] = scale_option_a.value
-            overriders["SCALE_RECIPE_B"] = scale_option_b.value
+            overriders["SCALE_RECIPE_A"] = scale_option_a # .value
+            overriders["SCALE_RECIPE_B"] = scale_option_b # .value
 
             if use_triton_scaling_template(
                 scale_option_a, scale_option_b, epilogue_scaling_types
@@ -1000,7 +1011,7 @@ def tuned_scaled_mm_v2(
     )
 
     # Early return for MX variants
-    if scale_a.dtype != torch.float32:
+    if scale_a[0].dtype != torch.float32 or (not supported_recipe) or (not is_single_level_scale):
         return autotune_select_algorithm(name, choices, input_nodes, layout)
 
     if (
@@ -1018,6 +1029,7 @@ def tuned_scaled_mm_v2(
     if is_nonzero and use_ck_gemm_template(layout, m, n, k):
         CKGemmTemplate.add_ck_gemm_choices(choices, layout, kernel_inputs.nodes())
 
+    print('_scaled_mm_v2 returning autotune')
     return autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
 
 
@@ -1108,6 +1120,7 @@ def tuned_scaled_mm(
         scale_option_a, scale_option_b = get_scaling_options(
             mat_a, mat_b, scale_a_size, scale_b_size
         )
+        print(f'{scale_option_a=}, {scale_option_b=}')
 
         # TODO (paulzhan): There is no template that exists for bias and TMA
         # Don't run tma template currently if bias exist
