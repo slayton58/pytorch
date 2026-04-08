@@ -1,9 +1,9 @@
 """
-AOTI integration for compiled PyTorch override dispatch logic.
+AOTI integration for compiled Python native override dispatch logic.
 
-This module provides hooks for integrating override compilation into the
-AOTInductor compilation pipeline, allowing override graphs to be compiled
-alongside models for python-less deployment.
+This module provides hooks for integrating Python native override compilation
+into the AOTInductor compilation pipeline, allowing torch._native override
+graphs to be compiled alongside models for python-less deployment.
 """
 
 import logging
@@ -14,33 +14,30 @@ from typing import Dict, List, Any, Optional
 
 import torch
 from torch._inductor import config
+from .python_native_aoti_condition_extraction import extract_conditions
+from .python_native_aoti_code_generation import compile_overrides
 
 log = logging.getLogger(__name__)
 
 
-def should_compile_overrides() -> bool:
-    """
-    Check if override compilation should be enabled.
-
-    Returns:
-        True if override compilation is enabled and conditions are met
-    """
-    # Check configuration flag
-    if not getattr(config.aot_inductor, 'compile_native_overrides', False):
-        return False
-
-    # Check if we have override graphs to compile
+def _get_override_graphs():
+    """Get override graphs from registry."""
     try:
         import torch._native.registry as registry
-        return bool(registry._graphs)
+        return registry._graphs
     except ImportError:
-        log.debug("torch._native not available, skipping override compilation")
-        return False
+        return {}
+
+
+def should_compile_overrides() -> bool:
+    """Check if override compilation should be enabled."""
+    return (getattr(config.aot_inductor, 'compile_native_overrides', False) and
+            _get_override_graphs())
 
 
 def compile_overrides_for_aoti(output_dir: str) -> Optional[Dict[str, Any]]:
     """
-    Compile override graphs and integrate them into AOTI build using optimized components.
+    Main AOTI integration function - compiles overrides for AOTI build pipeline.
 
     Args:
         output_dir: Directory where AOTI compilation outputs are being generated
@@ -48,49 +45,49 @@ def compile_overrides_for_aoti(output_dir: str) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with compilation results, or None if compilation was skipped
     """
+    # Input validation
+    if not output_dir or not isinstance(output_dir, str):
+        raise ValueError("output_dir must be a non-empty string")
+
     if not should_compile_overrides():
-        log.debug("Override compilation disabled or not available")
         return None
 
-    log.info("Compiling native overrides for AOTI...")
+    log.info("Compiling native overrides for AOTI")
+    import time
+    start_time = time.time()
 
     try:
-        # Import optimized components
-        import sys
-        from pathlib import Path
+        # Get override graphs
+        override_graphs = _get_override_graphs()
+        if not override_graphs:
+            return {"status": "no_overrides", "compiled_libraries": {}}
 
-        # Add tools directory to path
-        pytorch_root = Path(__file__).parent.parent.parent
-        tools_path = pytorch_root / "tools"
-        if str(tools_path) not in sys.path:
-            sys.path.insert(0, str(tools_path))
+        # Compile overrides to C++
+        compiled_libs = compile_overrides(override_graphs, output_dir)
 
-        # Use fixed ultra-compressed implementation
-        from tools.aoti.integration import compile_overrides_for_aoti as fixed_compile
+        compilation_time = time.time() - start_time
 
-        # Delegate directly to fixed compressed implementation
-        result = fixed_compile(output_dir)
-
-        if result and result.get("status") == "success":
-            compiled_libs = result["compiled_libraries"]
-            log.info(f"Successfully compiled {len(compiled_libs)} override libraries using compressed pipeline")
-
-            # Return AOTI-compatible format
+        if compiled_libs:
+            log.info(f"Successfully compiled {len(compiled_libs)} override libraries in {compilation_time:.2f}s")
             return {
                 "status": "success",
                 "compiled_libraries": compiled_libs,
-                "generated_files": list(compiled_libs.values()) if compiled_libs else [],
-                "statistics": result.get("statistics", {"generated_overrides": 0})
+                "generated_files": list(compiled_libs.values()),
+                "statistics": {
+                    "override_count": sum(len(ol) for ol in override_graphs.values()),
+                    "library_count": len(compiled_libs),
+                    "compilation_time": compilation_time
+                }
             }
-        elif result:
-            log.warning(f"Compressed override compilation: {result.get('status', 'unknown')}")
-            return result
         else:
-            log.debug("Override compilation skipped")
-            return None
+            return {
+                "status": "no_libraries",
+                "compiled_libraries": {},
+                "statistics": {"compilation_time": compilation_time}
+            }
 
     except Exception as e:
-        log.error(f"Error during optimized override compilation: {e}", exc_info=True)
+        log.error(f"Error during override compilation: {e}", exc_info=True)
         return {
             "status": "error",
             "error": str(e),

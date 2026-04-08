@@ -3050,6 +3050,64 @@ class ShapeFuncInfo(OpInfo):
         )
         self.ref = ref
 
+class DSLFuncInfo(OpInfo):
+    """Specialized OpInfo for DSL-provided functions"""
+    def __init__(
+        self,
+        *args,
+        dsl_name,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+        self.dsl_name = dsl_name
+
+
+class DSLUnaryUfuncInfo(UnaryUfuncInfo):
+    """Specialized UnaryUfuncInfo for DSL-provided unary functions"""
+    def __init__(
+        self,
+        *args,
+        dsl_name,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+        self.dsl_name = dsl_name
+
+
+class DSLBinaryUfuncInfo(BinaryUfuncInfo):
+    """Specialized BinaryUfuncInfo for DSL-provided binary functions"""
+    def __init__(
+        self,
+        *args,
+        dsl_name,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+        self.dsl_name = dsl_name
+
+
+class DSLReductionOpInfo(ReductionOpInfo):
+    """Specialized ReductionOpInfo for DSL-provided reduction operations"""
+    def __init__(
+        self,
+        *args,
+        dsl_name,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            **kwargs,
+        )
+        self.dsl_name = dsl_name
 
 def sample_inputs_foreach(
     self,

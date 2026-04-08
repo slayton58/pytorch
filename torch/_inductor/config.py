@@ -2115,6 +2115,12 @@ class aot_inductor:
     aoti_shim_library: str | list[str] | None = None
     aoti_shim_library_path: str | None = None
 
+    # Whether to compile native overrides from torch._native.registry into C++
+    # for python-less deployment. When enabled, extracts dispatch conditions
+    # from Python override functions and generates equivalent C++ code that
+    # can be compiled into AOTI binaries.
+    compile_native_overrides: bool = False
+
 
 # a convenient class that automatically sets a group of the configs in aot_inductor
 # it should only control the flags in aot_inductor.

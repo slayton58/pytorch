@@ -1,5 +1,9 @@
 """
-Condition extraction from Python override functions using AST analysis.
+Condition extraction from Python native override functions for AOTI compilation.
+
+This module provides AST-based analysis to extract dispatch conditions from
+Python native override functions, enabling their compilation into C++ code
+for AOTInductor python-less deployment.
 """
 
 import ast
@@ -139,6 +143,58 @@ class ConditionExtractor(ast.NodeVisitor):
                 param = self._get_name(left.func.value)
                 value = self._get_number(right)
                 return {"type": "numel_gte", "param": param, "value": value} if param and value is not None else None
+
+            # Handle x.size(0) >= 32
+            elif left.func.attr == "size" and len(left.args) == 1:
+                param = self._get_name(left.func.value)
+                dim = self._get_number(left.args[0])
+                value = self._get_number(right)
+                if param and dim is not None and value is not None:
+                    if isinstance(op, (ast.Gt, ast.GtE)):
+                        return {"type": "size_dim_gte", "param": param, "dim": dim, "value": value}
+                    elif isinstance(op, (ast.Lt, ast.LtE)):
+                        return {"type": "size_dim_lte", "param": param, "dim": dim, "value": value}
+                    elif isinstance(op, ast.Eq):
+                        return {"type": "size_dim_eq", "param": param, "dim": dim, "value": value}
+
+        # Handle cross-dimensional comparisons: x.shape[0] == x.shape[1] (MUST be checked first!)
+        elif (isinstance(left, ast.Subscript) and isinstance(right, ast.Subscript) and
+              isinstance(left.value, ast.Attribute) and isinstance(right.value, ast.Attribute) and
+              left.value.attr == "shape" and right.value.attr == "shape" and isinstance(op, ast.Eq)):
+            param_left = self._get_name(left.value.value)
+            param_right = self._get_name(right.value.value)
+            dim_left = self._get_number(left.slice)
+            dim_right = self._get_number(right.slice)
+
+            if (param_left and param_right and dim_left is not None and dim_right is not None and
+                param_left == param_right):  # Same tensor
+                return {"type": "shape_dim_eq_cross", "param": param_left, "dim1": dim_left, "dim2": dim_right}
+
+        # Handle x.shape[0] >= 100 (checked after cross-dimensional)
+        elif isinstance(left, ast.Subscript) and isinstance(left.value, ast.Attribute) and left.value.attr == "shape":
+            param = self._get_name(left.value.value)
+            dim = self._get_number(left.slice)
+            value = self._get_number(right)
+            if param and dim is not None and value is not None:
+                if isinstance(op, (ast.Gt, ast.GtE)):
+                    return {"type": "shape_dim_gte", "param": param, "dim": dim, "value": value}
+                elif isinstance(op, (ast.Lt, ast.LtE)):
+                    return {"type": "shape_dim_lte", "param": param, "dim": dim, "value": value}
+                elif isinstance(op, ast.Eq):
+                    return {"type": "shape_dim_eq", "param": param, "dim": dim, "value": value}
+
+        # Handle x.ndim == 2
+        elif isinstance(left, ast.Attribute) and left.attr == "ndim":
+            param = self._get_name(left.value)
+            value = self._get_number(right)
+            if param and value is not None:
+                if isinstance(op, ast.Eq):
+                    return {"type": "ndim_eq", "param": param, "value": value}
+                elif isinstance(op, (ast.Gt, ast.GtE)):
+                    return {"type": "ndim_gte", "param": param, "value": value}
+                elif isinstance(op, (ast.Lt, ast.LtE)):
+                    return {"type": "ndim_lte", "param": param, "value": value}
+
         return None
 
     def _extract_attribute(self, node):
@@ -146,6 +202,10 @@ class ConditionExtractor(ast.NodeVisitor):
         if node.attr == "is_cuda":
             param = self._get_name(node.value)
             return {"type": "is_cuda", "param": param} if param else None
+        elif node.attr == "ndim":
+            # Handle x.ndim when used directly in boolean context
+            param = self._get_name(node.value)
+            return {"type": "ndim_truthy", "param": param} if param else None
         return None
 
     def _extract_call(self, node):
@@ -231,3 +291,23 @@ class ConditionExtractor(ast.NodeVisitor):
 def extract_conditions(func) -> Dict[str, Any]:
     """Extract dispatch conditions from override function."""
     return ConditionExtractor().extract(func)
+
+
+def extract_conditions_from_source(source_code: str) -> Dict[str, Any]:
+    """Extract dispatch conditions directly from source code string."""
+    extractor = ConditionExtractor()
+    try:
+        # Clean up indentation issues
+        source = textwrap.dedent(source_code).strip()
+        tree = ast.parse(source)
+
+        # Visit and extract
+        extractor.conditions.clear()
+        extractor.visit(tree)
+
+        return extractor._serialize_conditions()
+
+    except SyntaxError as e:
+        return {"type": "error", "error": f"Syntax error: {str(e)}"}
+    except Exception as e:
+        return {"type": "error", "error": f"Extraction error: {str(e)}"}

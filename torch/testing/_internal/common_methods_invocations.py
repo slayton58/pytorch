@@ -47,6 +47,7 @@ from torch.testing._internal.common_utils import (
     torch_to_numpy_dtype_dict, numpy_to_torch_dtype, TEST_WITH_ASAN,
     GRADCHECK_NONDET_TOL, slowTest, TEST_WITH_SLOW,
     TEST_WITH_TORCHINDUCTOR,
+    OPINFO_RESTRICT_TO_DSL,
 )
 from torch.testing._utils import wrapper_set_seed
 
@@ -110,6 +111,10 @@ from torch.testing._internal.opinfo.core import (  # noqa: F401
     gradcheck_wrapper_masked_operation,
     gradcheck_wrapper_masked_pointwise_operation,
     clone_sample,
+    DSLFuncInfo,
+    DSLUnaryUfuncInfo,
+    DSLBinaryUfuncInfo,
+    DSLReductionOpInfo,
 )
 from torch.testing._internal.opinfo.refs import (  # NOQA: F401
     _find_referenced_opinfo,
@@ -23131,6 +23136,23 @@ op_db: list[OpInfo] = [
         ),
     ),
 ]
+
+# Add python_native ops tests
+try:
+    import sys
+    import os
+
+    # Add test directory to path if not already present
+    test_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 'test')
+    if test_dir not in sys.path:
+        sys.path.insert(0, test_dir)
+
+    from python_native.ops.silu.test_triton_silu import triton_silu_opinfo
+    op_db.append(triton_silu_opinfo)
+except ImportError:
+    # python_native ops tests not available (optional)
+    pass
+
 op_db += opinfo.definitions.op_db
 
 
@@ -26838,7 +26860,20 @@ python_ref_db = [
 ]
 python_ref_db += opinfo.definitions.python_ref_db
 
-# Common operator groupings
+# Apply DSL filtering by overriding op_db itself if requested
+if OPINFO_RESTRICT_TO_DSL:
+    # Find DSL operations (all DSL subclasses)
+    dsl_ops = [op for op in op_db if isinstance(op, (DSLFuncInfo, DSLUnaryUfuncInfo, DSLBinaryUfuncInfo, DSLReductionOpInfo))]
+
+    # Group by DSL name
+    dsl_ops_by_dsl = {}
+    for dsl in torch.backends.python_native.available_dsls:
+        dsl_ops_by_dsl[dsl] = [op for op in dsl_ops if op.dsl_name == dsl]
+
+    # Override op_db to only contain the requested DSL operations
+    op_db = dsl_ops_by_dsl[OPINFO_RESTRICT_TO_DSL]
+
+# Now derive ALL lists from op_db normally - they'll automatically be filtered if DSL filtering was applied
 ops_and_refs = op_db + python_ref_db
 unary_ufuncs = [op for op in ops_and_refs if isinstance(op, UnaryUfuncInfo)]
 binary_ufuncs = [op for op in ops_and_refs if isinstance(op, BinaryUfuncInfo)]

@@ -192,6 +192,19 @@ def _aoti_compile_and_package_inner(
 
     kwargs = kwargs or {}
 
+    # Compile native overrides if enabled
+    from .aoti_overrides import should_compile_overrides, compile_overrides_for_aoti
+
+    override_result = None
+    if should_compile_overrides():
+        # Get the output directory from aoti config
+        inductor_configs = inductor_configs or {}
+        output_path = inductor_configs.get("aot_inductor.output_path")
+        if output_path:
+            override_result = compile_overrides_for_aoti(output_path)
+            if override_result and override_result.get("status") == "success":
+                log.info(f"Successfully compiled {override_result['statistics']['generated_overrides']} native overrides")
+
     aoti_files = aot_compile(gm, args, kwargs, options=inductor_configs)
     assert isinstance(aoti_files, list)
 

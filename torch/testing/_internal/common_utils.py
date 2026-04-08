@@ -314,6 +314,17 @@ OPINFO_SAMPLE_INPUT_INDEX: int | None = TestEnvironment.def_setting(
     parse_fn=lambda val: None if val is None else int(val),
 )
 
+OPINFO_RESTRICT_TO_DSL: str | None = TestEnvironment.def_setting(
+    "OPINFO_RESTRICT_TO_DSL",
+    env_var="OPINFO_RESTRICT_TO_DSL",
+    default=None,
+    # Don't include the env var value in the repro command because the info will
+    # be queried from the tracked sample input instead
+    include_in_repro=True,
+    parse_fn=lambda val: None if val is None else str(val),
+)
+
+
 DEFAULT_DISABLED_TESTS_FILE = '.pytorch-disabled-tests.json'
 DEFAULT_SLOW_TESTS_FILE = 'slow_tests.json'
 
