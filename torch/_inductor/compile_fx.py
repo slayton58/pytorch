@@ -2066,6 +2066,31 @@ def compile_fx_aot(
 
     config_patches = maybe_aoti_standalone_config(config_patches)
 
+    # Initialize override_library_paths to avoid UnboundLocalError
+    override_library_paths = []
+
+    # Hook for compiling native overrides if enabled
+    # This must happen after output_path is determined but before main compilation
+    if config_patches.get("aot_inductor.compile_native_overrides", config.aot_inductor.compile_native_overrides):
+        import logging
+        log = logging.getLogger(__name__)
+        try:
+            from .aoti_overrides import compile_overrides_for_aoti
+            from .codecache import split_aot_inductor_output_path
+
+            # Get the output directory for override compilation
+            final_output_path = config_patches.get("aot_inductor.output_path", config.aot_inductor.output_path)
+            if final_output_path:
+                output_dir, _ = split_aot_inductor_output_path(final_output_path)
+                compile_result = compile_overrides_for_aoti(output_dir)
+                if compile_result and compile_result.get("status") == "success":
+                    # Collect the compiled override library paths
+                    override_library_paths = list(compile_result.get("compiled_libraries", {}).values())
+                    log.info(f"Compiled {len(override_library_paths)} native override libraries")
+        except Exception as e:
+            log.warning(f"Failed to compile native overrides: {e}")
+            # Don't fail the main compilation if override compilation fails
+
     extern_node_serializer = config_patches.pop("extern_node_serializer", None)
     saved_compile_id = model_.meta.get("dynamo_compile_id", None)
     saved_compile_context = torch._guards.CompileContext(saved_compile_id)
@@ -2090,6 +2115,48 @@ def compile_fx_aot(
         )
 
         assert isinstance(compiled_artifacts, CompiledAOTI)
+
+        # Add override libraries to AOTI artifacts for packaging in .pt2
+        if override_library_paths:
+            log.info(f"Adding {len(override_library_paths)} override libraries to AOTI artifacts")
+
+            # Add override library paths to the compiled artifacts filename list so they get packaged
+            if isinstance(compiled_artifacts.filename, list):
+                # filename is already a list - extend it
+                for lib_path in override_library_paths:
+                    if lib_path not in compiled_artifacts.filename:
+                        compiled_artifacts.filename.append(lib_path)
+                        log.info(f"Added override library to artifacts: {lib_path}")
+            else:
+                # filename is a string - convert to list and add override libraries
+                original_filename = compiled_artifacts.filename
+                compiled_artifacts.filename = [original_filename] + override_library_paths
+                log.info(f"Converted AOTI artifacts to list and added {len(override_library_paths)} override libraries")
+
+            # Also copy override libraries to the local paths expected by the runner
+            # This ensures they're available both in the .pt2 and for local loading
+            import shutil
+            from pathlib import Path
+
+            for lib_path in override_library_paths:
+                try:
+                    # Extract the relative path from the full path
+                    # e.g., /path/to/camcohd.../native_overrides/silu_CUDA.so -> camcohd.../native_overrides/silu_CUDA.so
+                    path_parts = Path(lib_path).parts
+                    if 'native_overrides' in path_parts:
+                        # Find the hash directory and preserve the relative structure
+                        native_overrides_idx = path_parts.index('native_overrides')
+                        if native_overrides_idx > 0:
+                            hash_dir_idx = native_overrides_idx - 1
+                            relative_path = Path(*path_parts[hash_dir_idx:])
+
+                            # Copy to current working directory with same structure
+                            target_path = Path(relative_path)
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(lib_path, target_path)
+                            log.info(f"Copied override library for runner: {target_path}")
+                except Exception as e:
+                    log.warning(f"Failed to copy override library {lib_path}: {e}")
 
         return compiled_artifacts.filename
 

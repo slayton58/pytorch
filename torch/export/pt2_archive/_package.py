@@ -282,17 +282,26 @@ def _package_aoti_files(
                 continue
 
             if file.endswith(".so"):
-                num_so_files += 1
-                if num_so_files > 1:
-                    raise RuntimeError(
-                        f"Multiple .so files found in {files}. "
-                        "You might need to clear your cache "
-                        "directory before calling aoti_compile again."
-                    )
+                # Check if this is an override library (in native_overrides directory)
+                if "native_overrides" in file:
+                    # This is an override library - allow multiple override .so files
+                    pass
+                else:
+                    # This is a main wrapper .so file - only allow one
+                    num_so_files += 1
+                    if num_so_files > 1:
+                        raise RuntimeError(
+                            f"Multiple main .so files found in {files}. "
+                            "You might need to clear your cache "
+                            "directory before calling aoti_compile again."
+                        )
 
             filename = os.path.basename(file)
             if filename.startswith(CUSTOM_OBJ_FILENAME_PREFIX):
                 new_filepath = os.path.join(CONSTANTS_DIR, filename)
+            elif "native_overrides" in file and filename.endswith(".so"):
+                # Put override libraries in a separate top-level directory to avoid AOTI model loading
+                new_filepath = os.path.join("native_overrides", filename)
             else:
                 new_filepath = os.path.join(AOTINDUCTOR_DIR, model_name, filename)
             logger.debug(
