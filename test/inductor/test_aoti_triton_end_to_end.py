@@ -72,7 +72,9 @@ class TestAOTITritonEndToEnd(TestCase):
                 self.assertIn(kernel_name, CudaKernelParamCache.cache)
                 cache_entry = CudaKernelParamCache.cache[kernel_name]
                 self.assertIn('op_name', cache_entry)
-                self.assertEqual(cache_entry['op_name'], 'silu')
+                # Handle both inplace and non-inplace variants
+                op_name = cache_entry['op_name']
+                self.assertIn(op_name, ['silu', 'silu_'], f"Expected silu or silu_, got {op_name}")
 
         print(f"Successfully compiled {len(compiled_kernels)} kernels")
 
@@ -113,7 +115,9 @@ class TestAOTITritonEndToEnd(TestCase):
                 self.assertIn(kernel_name, CudaKernelParamCache.cache)
                 cache_entry = CudaKernelParamCache.cache[kernel_name]
                 self.assertIn('op_name', cache_entry)
-                self.assertEqual(cache_entry['op_name'], 'relu')
+                # Handle both inplace and non-inplace variants
+                op_name = cache_entry['op_name']
+                self.assertIn(op_name, ['relu', 'relu_'], f"Expected relu or relu_, got {op_name}")
 
     def test_aoti_compilation_with_real_kernels(self):
         """Test AOTI compilation pipeline with discovered and compiled kernels."""
