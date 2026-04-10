@@ -575,8 +575,7 @@ def embed_override_cubins(aoti_output_dir: str, compiled_kernels: Dict) -> List[
         return []
 
     # Collect CUBIN paths from successfully compiled kernels
-    cubin_files = []
-    cubin_to_kernel = {}
+    cubin_tuples = []  # List of (cubin_path, kernel_name) tuples
 
     for kernel_name, kernel_data in compiled_kernels.items():
         if kernel_data.get('compiled', False):
@@ -585,33 +584,36 @@ def embed_override_cubins(aoti_output_dir: str, compiled_kernels: Dict) -> List[
             cubin_path = cache_entry.get('cubin_path')
 
             if cubin_path and Path(cubin_path).exists():
-                cubin_files.append(cubin_path)
-                cubin_to_kernel[cubin_path] = kernel_name
+                cubin_tuples.append((cubin_path, kernel_name))
                 log.info(f"Found CUBIN for embedding: {kernel_name} -> {cubin_path}")
 
-    if not cubin_files:
+    if not cubin_tuples:
         log.info("No CUBIN files found for embedding")
         return []
 
     try:
         # Use PyTorch's existing binary embedding system
-        log.info(f"Embedding {len(cubin_files)} CUBIN files using PyTorch infrastructure")
-        obj_files = batch_convert_cubins_to_obj(cubin_files)
+        log.info(f"Embedding {len(cubin_tuples)} CUBIN files using PyTorch infrastructure")
 
-        # Copy object files to override directory for linker
-        override_dir = Path(aoti_output_dir) / "native_overrides"
-        override_dir.mkdir(parents=True, exist_ok=True)
+        # Create temporary directory for object file generation
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_obj_dir:
+            obj_file_path = batch_convert_cubins_to_obj(cubin_tuples, temp_obj_dir)
 
-        embedded_files = []
-        for i, obj_file in enumerate(obj_files):
-            if Path(obj_file).exists():
-                target_path = override_dir / f"triton_kernel_{i}.o"
-                shutil.copy(obj_file, target_path)
-                embedded_files.append(str(target_path))
-                log.info(f"Embedded kernel object: {target_path}")
+            # Copy the single combined object file to override directory for linker
+            override_dir = Path(aoti_output_dir) / "native_overrides"
+            override_dir.mkdir(parents=True, exist_ok=True)
 
-        log.info(f"Successfully embedded {len(embedded_files)} kernel object files")
-        return embedded_files
+            if Path(obj_file_path).exists():
+                target_path = override_dir / "triton_kernels_combined.o"
+                shutil.copy(obj_file_path, target_path)
+                log.info(f"Embedded combined kernel object: {target_path}")
+
+                log.info(f"Successfully embedded {len(cubin_tuples)} kernel object files into single combined object")
+                return [str(target_path)]
+            else:
+                log.warning(f"Combined object file not found: {obj_file_path}")
+                return []
 
     except Exception as e:
         log.warning(f"Failed to embed CUBIN files: {e}")
@@ -674,7 +676,7 @@ def compile_overrides_for_aoti(output_dir: str) -> Optional[Dict[str, Any]]:
 
         if compiled_libs:
             log.info(f"Successfully compiled {len(compiled_libs)} override libraries in {compilation_time:.2f}s")
-            return {
+            result = {
                 "status": "success",
                 "compiled_libraries": compiled_libs,
                 "generated_files": list(compiled_libs.values()),
@@ -687,6 +689,7 @@ def compile_overrides_for_aoti(output_dir: str) -> Optional[Dict[str, Any]]:
                     "cubin_objects_embedded": len(embedded_objects)
                 }
             }
+            return result
         else:
             return {
                 "status": "no_libraries",

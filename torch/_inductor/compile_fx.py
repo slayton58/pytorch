@@ -2079,11 +2079,11 @@ def compile_fx_aot(
             from .codecache import split_aot_inductor_output_path
 
             # Get the output directory for override compilation
-            final_output_path = config_patches.get("aot_inductor.output_path", config.aot_inductor.output_path)
-            if final_output_path:
-                output_dir, _ = split_aot_inductor_output_path(final_output_path)
-                compile_result = compile_overrides_for_aoti(output_dir)
-                if compile_result and compile_result.get("status") == "success":
+            # Use a proper temporary directory instead of AOTI working directory to avoid polluting CWD
+            import tempfile
+            override_temp_dir = tempfile.mkdtemp(prefix="aoti_overrides_", dir="/tmp")
+            compile_result = compile_overrides_for_aoti(override_temp_dir)
+            if compile_result and compile_result.get("status") == "success":
                     # Collect the compiled override library paths
                     override_library_paths = list(compile_result.get("compiled_libraries", {}).values())
                     log.info(f"Compiled {len(override_library_paths)} native override libraries")
@@ -2132,31 +2132,6 @@ def compile_fx_aot(
                 original_filename = compiled_artifacts.filename
                 compiled_artifacts.filename = [original_filename] + override_library_paths
                 log.info(f"Converted AOTI artifacts to list and added {len(override_library_paths)} override libraries")
-
-            # Also copy override libraries to the local paths expected by the runner
-            # This ensures they're available both in the .pt2 and for local loading
-            import shutil
-            from pathlib import Path
-
-            for lib_path in override_library_paths:
-                try:
-                    # Extract the relative path from the full path
-                    # e.g., /path/to/camcohd.../native_overrides/silu_CUDA.so -> camcohd.../native_overrides/silu_CUDA.so
-                    path_parts = Path(lib_path).parts
-                    if 'native_overrides' in path_parts:
-                        # Find the hash directory and preserve the relative structure
-                        native_overrides_idx = path_parts.index('native_overrides')
-                        if native_overrides_idx > 0:
-                            hash_dir_idx = native_overrides_idx - 1
-                            relative_path = Path(*path_parts[hash_dir_idx:])
-
-                            # Copy to current working directory with same structure
-                            target_path = Path(relative_path)
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(lib_path, target_path)
-                            log.info(f"Copied override library for runner: {target_path}")
-                except Exception as e:
-                    log.warning(f"Failed to copy override library {lib_path}: {e}")
 
         return compiled_artifacts.filename
 

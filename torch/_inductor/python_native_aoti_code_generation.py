@@ -26,7 +26,13 @@ class CodeGenerator:
     """Generates C++ code for PyTorch override compilation."""
 
     def __init__(self, cache_dir: Optional[str] = None, compiled_kernels: Optional[Dict] = None):
-        self.cache_dir = Path(cache_dir) if cache_dir else Path("/tmp/aoti_overrides")
+        if cache_dir:
+            self.cache_dir = Path(cache_dir)
+        else:
+            # Use a proper temporary directory to avoid polluting CWD
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix="aoti_overrides_", dir="/tmp")
+            self.cache_dir = Path(temp_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Use PyTorch's existing systems with correct APIs
