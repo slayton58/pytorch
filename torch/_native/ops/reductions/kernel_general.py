@@ -55,7 +55,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr, Float32, Int32, Int64
+from cutlass import const_expr, Float32, Float64, Int32, Int64
 
 import torch
 from torch._tensor_iterator import reduce_op
@@ -309,7 +309,12 @@ _stream = _L.stream
 _compile = (
     _L.compile
 )  # _L.compile: cute.compile + options="--enable-tvm-ffi" (fast per-call arg passing)
-_PART_TORCH = {Float32: torch.float32, Int32: torch.int32, Int64: torch.int64}
+_PART_TORCH = {
+    Float32: torch.float32,
+    Float64: torch.float64,
+    Int32: torch.int32,
+    Int64: torch.int64,
+}
 
 _COMPILE_CACHE = {}
 
@@ -634,5 +639,11 @@ def reduce_all(trait, trait_key, x, out_dtype, block=256, grid_mult=4):
         final=True,
         block=block,
     )
-    _launch(s2, ("all2", trait_key, out_dtype) + s2.cache_sig, parts, [out])
+    # Key on the partial-buffer dtypes the stage-2 kernel binds to, not just
+    # out_dtype: for index traits out_dtype is the int32 INDEX and does not track
+    # the value accumulator, so fp32 and fp64 argmax would otherwise collide on one
+    # cached kernel (the fp32 one then rejects fp64 partials).
+    part_dtypes = tuple(p.dtype for p in parts)
+    s2_key = ("all2", trait_key, out_dtype, part_dtypes) + s2.cache_sig
+    _launch(s2, s2_key, parts, [out])
     return out.reshape(())
