@@ -55,7 +55,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr, Float32, Int32
+from cutlass import const_expr, Float32, Int32, Int64
 
 import torch
 from torch._tensor_iterator import reduce_op
@@ -309,7 +309,7 @@ _stream = _L.stream
 _compile = (
     _L.compile
 )  # _L.compile: cute.compile + options="--enable-tvm-ffi" (fast per-call arg passing)
-_PART_TORCH = {Float32: torch.float32, Int32: torch.int32}
+_PART_TORCH = {Float32: torch.float32, Int32: torch.int32, Int64: torch.int64}
 
 _COMPILE_CACHE = {}
 
