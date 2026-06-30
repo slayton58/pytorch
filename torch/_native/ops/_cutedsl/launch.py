@@ -30,6 +30,7 @@ torch2cute = {
     torch.bfloat16: cutlass.BFloat16,
     torch.int32: Int32,
     torch.int64: Int64,
+    torch.bool: cutlass.Boolean,
 }
 
 
@@ -48,6 +49,20 @@ def _ro(t, read_only):
 def cute_tensor(t, read_only=False):
     # Wrap a torch tensor as a cute tensor via the fast tvm-ffi exchange.
     ct = cute.runtime.from_dlpack(_ro(t, read_only), enable_tvm_ffi=True)
+    ct.element_type = torch2cute[t.dtype]
+    return ct
+
+
+def cute_tensor_vec(t, V, read_only=False):
+    # Flat-coalesce a contiguous tensor to a (numel/V, V) cute tensor for the
+    # vectorized elementwise path: row i is one thread's V-wide fragment. assumed
+    # 16-byte alignment lets the DSL emit wide (128-bit) loads; torch allocations are
+    # >=256 B aligned and V*dtype == 128 bits, so this is safe. Caller guarantees
+    # numel % V == 0 and contiguity (see kernel._vec_ok).
+    tv = t.reshape(-1, V)
+    ct = cute.runtime.from_dlpack(
+        _ro(tv, read_only), assumed_align=16, enable_tvm_ffi=True
+    )
     ct.element_type = torch2cute[t.dtype]
     return ct
 
