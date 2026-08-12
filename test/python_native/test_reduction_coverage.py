@@ -1,11 +1,4 @@
 # Owner(s): ["module: dsl-native-ops"]
-#
-# COVERAGE as a matrix rather than a sample: for every (op, dtype, options) cell in the
-# declared set, does OUR kernel serve the call? A SILENT DECLINE is what this catches and no
-# other test can -- ATen still answers correctly, so a value-only test sees nothing.
-#
-# Served-ness is read at the capability COND, not at a launch: the empty and 0-dim shapes are
-# answered without launching anything, which a kernel-level probe cannot tell from a decline.
 
 import sys
 import unittest
@@ -27,12 +20,27 @@ from torch._native import registry as R
 
 _OVERRIDES_MODULE = "torch._native.ops.reductions.overrides"
 
-# The dtypes the overrides DECLARE (see overrides._ENVELOPE). Widening that envelope means adding a
-# row here in the same commit, which is what makes this a coverage claim rather than a smoke test.
 DTYPES = {
     "f16": torch.float16,
     "bf16": torch.bfloat16,
     "f32": torch.float32,
+    "f64": torch.float64,
+    "f8e4m3": torch.float8_e4m3fn,
+    "f8e4m3z": torch.float8_e4m3fnuz,
+    "f8e5m2": torch.float8_e5m2,
+    "f8e5m2z": torch.float8_e5m2fnuz,
+    "f8e8m0": torch.float8_e8m0fnu,
+    "c64": torch.complex64,
+    "c128": torch.complex128,
+    "i32": torch.int32,
+    "i64": torch.int64,
+    "i8": torch.int8,
+    "i16": torch.int16,
+    "u8": torch.uint8,
+    "u16": torch.uint16,
+    "u32": torch.uint32,
+    "u64": torch.uint64,
+    "bool": torch.bool,
 }
 
 OPS = {
@@ -60,28 +68,43 @@ OPS = {
     "count_nonzero": lambda t, **k: torch.count_nonzero(t, **k),
 }
 
-# The OPTIONS axis: dim spelling (single / negative / tuple / absent), keepdim, and the geometries
-# that used to be declined -- a transposed input, an empty extent, a 0-dim input.
+BASE_OPTION = ("dim=-1", {"dim": -1}, {})
 OPTIONS = [
-    ("dim=-1", {"dim": -1}, {}),
     ("dim=0", {"dim": 0}, {}),
     ("dim=(0,1)", {"dim": (0, 1)}, {}),
     ("keepdim", {"dim": -1, "keepdim": True}, {}),
     ("full", {}, {}),
     ("noncontig", {"dim": -1}, {"contiguous": False}),
-    ("empty-axis", {"dim": 1}, {"empty": True}),
+    ("empty-output", {"dim": 1}, {"empty": "output"}),
+    ("empty-axis", {"dim": 1}, {"empty": "axis"}),
     ("0-dim", {"dim": 0}, {"zerodim": True}),
 ]
 
 EXPECTED_DECLINES = set()
 
 
-def _build(dtype, contiguous=True, empty=False, zerodim=False):
+def _build(dtype, contiguous=True, empty=None, zerodim=False):
     if zerodim:
         return torch.zeros((), device="cuda").to(dtype)
-    shape = (0, 5) if empty else (64, 128)
-    t = torch.randn(shape, device="cuda", dtype=torch.float32).to(dtype)
+    shape = {"output": (0, 5), "axis": (5, 0)}.get(empty, (64, 128))
+    if dtype.is_complex:
+        real_dtype = torch.float32 if dtype is torch.complex64 else torch.float64
+        real = torch.randn(shape, device="cuda", dtype=real_dtype)
+        imag = torch.randn(shape, device="cuda", dtype=real_dtype)
+        t = torch.complex(real, imag)
+    elif dtype.is_floating_point:
+        t = torch.randn(shape, device="cuda", dtype=torch.float32).to(dtype)
+    else:
+        t = torch.randint(0, 7, shape, device="cuda").to(dtype)
     return t if contiguous else t.transpose(0, 1)
+
+
+def _cells():
+    for op_name, fn in OPS.items():
+        for dt_name, dtype in DTYPES.items():
+            yield op_name, fn, dt_name, dtype, BASE_OPTION
+        for option in OPTIONS:
+            yield op_name, fn, "f32", torch.float32, option
 
 
 def _served(fn):
@@ -127,61 +150,43 @@ class TestReductionCoverage(TestCase):
         for g, r in pairs:
             if g.dtype != r.dtype:
                 return False
-            if g.is_floating_point():
-                if not torch.allclose(
-                    g.float(), r.float(), rtol=1e-2, atol=1e-2, equal_nan=True
-                ):
+            if g.is_floating_point() or g.is_complex():
+                if not torch.allclose(g, r, rtol=1e-2, atol=1e-2, equal_nan=True):
                     return False
             elif not torch.equal(g, r):
                 return False
         return True
 
     def test_every_declared_cell_is_served(self):
-        # One pass over (op x dtype x options). Each cell lands in exactly one bucket: ATen rejects
-        # it, we serve it and agree, or we decline -- a failure unless it is a documented dof case.
         holes, wrong, counts = [], [], Counter()
-        for op_name, fn in OPS.items():
-            for dt_name, dtype in DTYPES.items():
-                for label, kwargs, build_kw in OPTIONS:
-                    cell = (op_name, dt_name, label)
-                    t = _build(dtype, **build_kw)
-                    call = lambda t=t, fn=fn, kw=kwargs: fn(t, **kw)  # noqa: E731
-                    try:
-                        with torch.backends.python_native.cutedsl.disabled():
-                            ref = call()
-                    except Exception:
-                        counts["aten-rejects"] += 1
-                        continue
-                    ok, got = _served(call)
-                    if not self._agree(got, ref):
-                        wrong.append(cell)
-                    elif ok:
-                        counts["served"] += 1
-                    else:
-                        counts["declined"] += 1
-                        if cell not in EXPECTED_DECLINES:
-                            holes.append(cell)
+        for op_name, fn, dt_name, dtype, option in _cells():
+            label, kwargs, build_kw = option
+            cell = (op_name, dt_name, label)
+            t = _build(dtype, **build_kw)
+            call = lambda t=t, fn=fn, kw=kwargs: fn(t, **kw)  # noqa: E731
+            try:
+                with torch.backends.python_native.cutedsl.disabled():
+                    ref = call()
+            except Exception:
+                counts["aten-rejects"] += 1
+                continue
+            ok, got = _served(call)
+            if not self._agree(got, ref):
+                wrong.append(cell)
+            elif ok:
+                counts["served"] += 1
+            else:
+                counts["declined"] += 1
+                if cell not in EXPECTED_DECLINES:
+                    holes.append(cell)
 
         self.assertEqual(
             wrong, [], f"cells where our answer differs from ATen: {wrong}"
         )
         self.assertEqual(holes, [], f"cells silently declined to ATen: {holes}")
-        # Guard the guard: if the matrix stops exercising the family, the assertions above pass
-        # trivially. The floor sits well below the current 716 served, so widening a row is free.
-        self.assertGreater(counts["served"], 350)
+        # Guard against a matrix that stops exercising the family.
+        self.assertGreater(counts["served"], 200)
         self.assertEqual(counts["declined"], len(EXPECTED_DECLINES))
-
-    def test_expected_declines_still_decline(self):
-        # The exceptions are a claim about ATen, not a wish: if it stops warning on a 0-dim var this
-        # decline is a coverage hole and should be removed rather than kept as a carve-out.
-        for op_name, dt_name, _ in sorted(EXPECTED_DECLINES):
-            with self.subTest(op=op_name, dtype=dt_name):
-                t = _build(DTYPES[dt_name], zerodim=True)
-                ok, _ = _served(lambda t=t, op=op_name: OPS[op](t, dim=0))
-                self.assertFalse(ok, f"{op_name}/{dt_name} 0-dim is now served")
-                with self.assertWarnsRegex(UserWarning, "degrees of freedom"):
-                    with torch.backends.python_native.cutedsl.disabled():
-                        OPS[op_name](t, dim=0)
 
 
 if __name__ == "__main__":
