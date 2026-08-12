@@ -50,6 +50,15 @@ class TestCuTeDSLReductionWiring(TestCase):
         # Group B: single-output index (argmax) and two-output (max.dim).
         self.assertEqual(self._fired_count(lambda: torch.argmax(x, dim=-1)), 1)
         self.assertEqual(self._fired_count(lambda: torch.max(x, dim=-1)), 1)
+        # Group C: parameterized / non-float-output single reductions.
+        self.assertEqual(self._fired_count(lambda: torch.var(x, dim=-1)), 1)
+        self.assertEqual(
+            self._fired_count(lambda: torch.linalg.vector_norm(x, dim=-1)), 1
+        )
+        self.assertEqual(self._fired_count(lambda: torch.count_nonzero(x, dim=-1)), 1)
+        # Group D: two float-output reductions.
+        self.assertEqual(self._fired_count(lambda: torch.var_mean(x, dim=-1)), 1)
+        self.assertEqual(self._fired_count(lambda: torch.aminmax(x, dim=-1)), 1)
 
     def test_unsupported_dtype_falls_back(self):
         # Integer input is outside the supported set -> must NOT hit our kernel.
@@ -68,12 +77,66 @@ class TestCuTeDSLReductionWiring(TestCase):
             lambda t: torch.sum(t, dim=-1),
             lambda t: torch.sum(t, dim=0),
             lambda t: torch.sum(t),  # reduce-ALL of a non-contiguous input
+            lambda t: torch.amax(t, dim=-1),
+            lambda t: torch.var(t, dim=-1),
+            lambda t: torch.argmax(t, dim=-1),
         ):
             with self.subTest(fn=fn):
                 self.assertEqual(self._fired_count(lambda: fn(xt)), 1)
                 with _disabled():
                     ref = fn(xt)
                 self.assertEqual(fn(xt), ref)
+
+    @staticmethod
+    def _compiled_kernel_count():
+        # Every compiled reduction kernel lands in exactly one of these caches, keyed on its
+        # compile signature -- so len() IS the number of distinct kernels built so far.
+        from torch._native.ops.reductions import (
+            kernel_coltile,
+            kernel_general,
+            kernel_rowtile,
+            kernel_xcta,
+        )
+
+        caches = (
+            kernel_general._COMPILE_CACHE,
+            kernel_rowtile._CACHE,
+            kernel_coltile._CACHE,
+            kernel_xcta._PLAN,
+        )
+        return sum(len(c) for c in caches), caches
+
+    def test_kernel_count_does_not_scale_with_shape(self):
+        # GUARD. The design rests on compiling O(op x dtype x structure) kernels, not O(shapes): a
+        # size-derived const_expr breaks that and shows up as compile time, not a wrong answer. The
+        # bound is RELATIVE so it survives adding kernels. These N share a vec class and one bucket
+        # rung, so a correct stack compiles the same kernels for two of them as for ten. An order
+        # that fixes its add DAG at compile time cannot satisfy this and is opt-in, so off here.
+        few = [4096, 4104]
+        many = [4096, 4104, 4112, 4120, 4128, 4136, 4144, 4152, 4160, 4168]
+
+        def run(sizes):
+            _, caches = self._compiled_kernel_count()
+            for c in caches:
+                c.clear()
+            for n in sizes:
+                x = torch.randn(512, n, device="cuda")
+                torch.sum(x, dim=-1)
+                torch.amax(x, dim=-1)
+                # column path too: its split factor and stage-2 mapping are shape-derived
+                torch.sum(x, dim=0)
+                del x
+            return self._compiled_kernel_count()[0]
+
+        n_few = run(few)
+        n_many = run(many)
+        self.assertEqual(
+            n_many,
+            n_few,
+            f"compiled kernels grew from {n_few} (2 shapes) to {n_many} (10 shapes): a "
+            f"size-derived const_expr has crept back in",
+        )
+
 
     def test_scalar_falls_back(self):
         # 0-dim input must not crash the cond (regression: d % ndim with ndim==0).
@@ -146,6 +209,9 @@ class TestCuTeDSLReductionWiring(TestCase):
                 1,
                 f"{name} must be served, not declined",
             )
+            with _disabled():
+                ref = torch.sum(x, dim=dim)
+            self.assertEqual(torch.sum(x, dim=dim), ref, atol=1e-3, rtol=1e-3)
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs >= 2 GPUs")
     def test_other_device_defers(self):
