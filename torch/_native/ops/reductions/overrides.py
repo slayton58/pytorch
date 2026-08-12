@@ -205,6 +205,98 @@ def _prod_cond(self, dim, keepdim=False, *, dtype=None):
     return _base_cond(self, dim) and _supported_out_dtype(dtype)
 
 
+# --- Group B: INDEX reductions. The traits carry the index in a second accumulator field,
+# so these route through the index-aware paths. Ties and NaNs match aten (first wins). ---
+
+
+def _idx_width(self, red):
+    # The in-kernel INDEX accumulator: the winning position ranges over the REDUCED extent, so
+    # Int32 overflows at 2**31. The OUTPUT buffer is always int64, aten's index dtype.
+    import cutlass
+
+    if red is None:
+        extent = self.numel()
+    else:
+        extent = 1
+        for d in red:
+            extent *= self.shape[d]
+    if extent > (1 << 31) - 1:
+        return cutlass.Int64, "i64"
+    return cutlass.Int32, "i32"
+
+
+def _run_arg(make_trait, key, self, red, keepdim):
+    # The kernel STORES int64 directly, since a trailing widening cast is a whole extra ~2us
+    # launch; the accumulator keeps _idx_width's narrower type so shuffles stay cheap.
+    acc, _ = _acc_policy()[self.dtype]
+    idx_cute, tag = _idx_width(self, red)
+    trait = make_trait(acc, idx_cute)
+    key = key + tag  # distinct idx width -> distinct compiled kernel
+    if red is None:
+        out = kg.reduce_all(trait, key, self, torch.int64)
+    else:
+        out = kg.reduce_dim(trait, key, self, sorted(red), torch.int64)
+    return _keepdim_reshape(out, self.shape, red, keepdim)
+
+
+def _run_dim2(make_trait, key, self, dim, keepdim):
+    # Values keep the input dtype; the index is stored as int64 directly, as in _run_arg. Via
+    # _normalize_dims, not `dim % self.dim()`, which is undefined for a 0-dim input.
+    acc, _ = _acc_policy()[self.dtype]
+    red = {dim % self.dim()}
+    idx_cute, tag = _idx_width(self, red)
+    trait = make_trait(acc, idx_cute)
+    dts = [self.dtype, torch.int64]
+    vals, idxs = kg.reduce_dim2(trait, key + tag, self, sorted(red), dts)
+    vals = _keepdim_reshape(vals, self.shape, red, keepdim)
+    idxs = _keepdim_reshape(idxs, self.shape, red, keepdim)
+    return vals, idxs
+
+
+def _argmax_impl(self, dim=None, keepdim=False):
+    red = _normalize_dims(dim, self.dim())
+    return _run_arg(
+        lambda acc, idx: T.ArgMaxOps(acc=acc, idx=idx), "argmax", self, red, keepdim
+    )
+
+
+def _argmin_impl(self, dim=None, keepdim=False):
+    red = _normalize_dims(dim, self.dim())
+    return _run_arg(
+        lambda acc, idx: T.ArgMinOps(acc=acc, idx=idx), "argmin", self, red, keepdim
+    )
+
+
+def _max_dim_impl(self, dim, keepdim=False):
+    return _run_dim2(
+        lambda acc, idx: T.MaxDimOps(acc=acc, idx=idx), "max.dim", self, dim, keepdim
+    )
+
+
+def _min_dim_impl(self, dim, keepdim=False):
+    return _run_dim2(
+        lambda acc, idx: T.MinDimOps(acc=acc, idx=idx), "min.dim", self, dim, keepdim
+    )
+
+
+def _argmax_cond(self, dim=None, keepdim=False):
+    return _base_cond(self, dim, has_index=True)
+
+
+def _argmin_cond(self, dim=None, keepdim=False):
+    return _base_cond(self, dim, has_index=True)
+
+
+def _max_dim_cond(self, dim, keepdim=False):
+    # max.dim/min.dim take a required single int dim (not a list); _base_cond's
+    # _dims_ok accepts the int form and declines scalars / out-of-range.
+    return _base_cond(self, dim, nouts=2, has_index=True)
+
+
+def _min_dim_cond(self, dim, keepdim=False):
+    return _base_cond(self, dim, nouts=2, has_index=True)
+
+
 def register_reduction_overrides() -> None:
     # CUDA overrides; cu.register_op_override short-circuits when the CuteDSL
     # runtime is unavailable, so this is safe to call unconditionally at import.
@@ -219,4 +311,17 @@ def register_reduction_overrides() -> None:
     cu.register_op_override("aten", "amin", "CUDA", cond=_amin_cond, impl=_amin_impl)
     cu.register_op_override(
         "aten", "prod.dim_int", "CUDA", cond=_prod_cond, impl=_prod_impl
+    )
+    # Group B: argmax / argmin (int64 index) and max.dim / min.dim (values, indices).
+    cu.register_op_override(
+        "aten", "argmax", "CUDA", cond=_argmax_cond, impl=_argmax_impl
+    )
+    cu.register_op_override(
+        "aten", "argmin", "CUDA", cond=_argmin_cond, impl=_argmin_impl
+    )
+    cu.register_op_override(
+        "aten", "max.dim", "CUDA", cond=_max_dim_cond, impl=_max_dim_impl
+    )
+    cu.register_op_override(
+        "aten", "min.dim", "CUDA", cond=_min_dim_cond, impl=_min_dim_impl
     )

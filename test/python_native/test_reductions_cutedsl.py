@@ -20,7 +20,7 @@ class TestCuTeDSLReductionWiring(TestCase):
     def _fired_count(self, fn):
         from torch._native.ops.reductions import kernel_general as kg
 
-        names = ("reduce_dim", "reduce_all")
+        names = ("reduce_dim", "reduce_dim2", "reduce_all")
         orig = {nm: getattr(kg, nm) for nm in names}
         n = [0]
 
@@ -47,6 +47,9 @@ class TestCuTeDSLReductionWiring(TestCase):
         self.assertEqual(self._fired_count(lambda: torch.sum(x, dim=-1)), 1)
         self.assertEqual(self._fired_count(lambda: torch.mean(x, dim=-1)), 1)
         self.assertEqual(self._fired_count(lambda: torch.amax(x, dim=-1)), 1)
+        # Group B: single-output index (argmax) and two-output (max.dim).
+        self.assertEqual(self._fired_count(lambda: torch.argmax(x, dim=-1)), 1)
+        self.assertEqual(self._fired_count(lambda: torch.max(x, dim=-1)), 1)
 
     def test_unsupported_dtype_falls_back(self):
         # Integer input is outside the supported set -> must NOT hit our kernel.
