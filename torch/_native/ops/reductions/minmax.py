@@ -18,7 +18,7 @@ def fmax_nan(a, b, dtype: cutlass.Constexpr):
     if const_expr(dtype is Float32):
         return Float32(nvvm.fmax(a.ir_value(), b.ir_value(), nan=True))
     if const_expr(dtype.is_integer):
-        return b if b > a else a
+        return max(a, b)
     return b if ((b > a) or (b != b)) else a
 
 
@@ -28,5 +28,5 @@ def fmin_nan(a, b, dtype: cutlass.Constexpr):
     if const_expr(dtype is Float32):
         return Float32(nvvm.fmin(a.ir_value(), b.ir_value(), nan=True))
     if const_expr(dtype.is_integer):
-        return b if b < a else a
+        return min(a, b)
     return b if ((b < a) or (b != b)) else a

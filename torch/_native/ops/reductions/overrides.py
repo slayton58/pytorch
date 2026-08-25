@@ -6,6 +6,7 @@ Supported layouts use a fast path or the general TensorIterator decode.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,6 +53,10 @@ def _normalize_dims(dim, ndim: int):
     dims = [dim] if isinstance(dim, int) else list(dim)
     if len(dims) == 0:
         return None
+    if ndim == 0:
+        # A 0-dim input reduces to itself, and `d % 0` would raise; _dims_ok has already
+        # rejected every dim but 0 / -1.
+        return None
     return {d % ndim for d in dims}
 
 
@@ -59,7 +64,10 @@ def _dims_ok(dim, ndim: int) -> bool:
     # Decline any dim aten would reject, WITHOUT raising -- a cond must never throw. At
     # ndim 0 only None / [] / 0 / -1 are valid, and `d % ndim` is undefined there.
     if ndim == 0:
-        return False
+        if dim is None:
+            return True
+        dims = [dim] if isinstance(dim, int) else list(dim)
+        return len([d for d in dims if d in (0, -1)]) == len(dims) <= 1
     if ndim > 64:
         return False
     if dim is None:
@@ -76,14 +84,60 @@ def _dims_ok(dim, ndim: int) -> bool:
     return True
 
 
-def _geometry_supported(x: torch.Tensor, dim, nouts=1, has_index=False) -> bool:
+def _geometry_supported(x: torch.Tensor, dim, nouts=1, has_index=False, empty_id=None):
     # CAPABILITY only -- no layout declines, since the general arm addresses via the TI
     # decode. What does: an empty axis with no identity, and an index reduce-all of a
     # non-contiguous input, where ATen's flat index is not the storage offset.
     if x.numel() == 0:
-        return False
+        return _empty_ok(x, dim, empty_id)
     red = _normalize_dims(dim, x.dim())
     return not (has_index and red is None and not x.is_contiguous())
+
+
+# What ATen returns for an EMPTY reduced axis, per trait key. An ABSENT key has no
+# identity and ATen raises: the max/min family and the +-inf norms.
+_EMPTY_ID = {
+    "sum": 0,
+    "prod": 1,
+    "mean": float("nan"),
+    "cnz": 0,
+    "all": True,
+    "any": False,
+}
+
+
+def _empty_id_for(key):
+    if key is not None and key.startswith("vnorm"):
+        # vector_norm's key carries its ord. A finite p is an empty sum of |x|**p, so 0;
+        # +-inf has no identity ("cannot compute the inf norm on the dimension").
+        return 0 if math.isfinite(float(key[len("vnorm") :])) else None
+    return _EMPTY_ID.get(key)
+
+
+def _reduced_shape(x_shape, red: set | None, keepdim: bool):
+    """The output shape of reducing `red` (None = every axis) out of `x_shape`."""
+    if red is None:
+        return [1] * len(x_shape) if keepdim else []
+    if keepdim:
+        return [1 if i in red else s for i, s in enumerate(x_shape)]
+    return [s for i, s in enumerate(x_shape) if i not in red]
+
+
+def _empty_ok(x: torch.Tensor, dim, empty_id) -> bool:
+    # Serviceable when a KEPT extent is zero (the output is empty, so no identity is needed
+    # -- true even of amax) or when the op HAS one. var/std decline via _dof_ok.
+    kept = _reduced_shape(x.shape, _normalize_dims(dim, x.dim()), False)
+    return math.prod(kept) == 0 or empty_id is not None
+
+
+def _empty_result(self: torch.Tensor, red, keepdim, dtypes, fills):
+    # Nothing to launch: an allocation (empty output) or a fill (the identity over the kept
+    # shape). torch.full covers both -- over an empty shape it writes nothing.
+    shape = _reduced_shape(self.shape, red, keepdim)
+    return tuple(
+        torch.full(shape, 0 if f is None else f, dtype=d, device=self.device)
+        for d, f in zip(dtypes, fills)
+    )
 
 
 def _keepdim_reshape(out: torch.Tensor, x_shape, red: set | None, keepdim: bool):
@@ -112,7 +166,7 @@ def _supported_out_dtype(dtype) -> bool:
     return dtype is None or dtype in _SUPPORTED_DTYPES
 
 
-def _base_cond(self, dim, nouts=1, has_index=False) -> bool:
+def _base_cond(self, dim, nouts=1, has_index=False, key=None) -> bool:
     # Shared capability gate; never raises, since a throwing cond crashes the dispatcher
     # instead of falling back. NEG/CONJ declines: the exported buffer holds the UNNEGATED
     # values, and resolving the bit here would re-enter our own copy_ override. An unaligned
@@ -126,13 +180,16 @@ def _base_cond(self, dim, nouts=1, has_index=False) -> bool:
         and not self.is_conj()
         and self.const_data_ptr() % 16 == 0
         and _dims_ok(dim, self.dim())
-        and _geometry_supported(self, dim, nouts, has_index)
+        and _geometry_supported(self, dim, nouts, has_index, _empty_id_for(key))
     )
 
 
 def _run1(make_trait, key, self, red, keepdim, out_torch_dtype):
     # Every single-output reduction override funnels through here: the accumulator comes from
     # _acc_policy, and the result is aten's output dtype for this op.
+    if self.numel() == 0:
+        fill = _empty_id_for(key)
+        return _empty_result(self, red, keepdim, [out_torch_dtype], [fill])[0]
     acc, kout = _acc_policy()[self.dtype]
     trait = make_trait(acc)
     # STORE aten's output dtype where the store can produce it: casting the fp32 accumulator
@@ -152,7 +209,7 @@ def _run1(make_trait, key, self, red, keepdim, out_torch_dtype):
 def _sum_cond(self, dim=None, keepdim=False, *, dtype=None):
     # No yield to the inner-tree override, deliberately: it registers FIRST and the router is
     # first-match-wins, so yielding would hand what IT declines to aten rather than serving it.
-    return _base_cond(self, dim) and _supported_out_dtype(dtype)
+    return _base_cond(self, dim, key="sum") and _supported_out_dtype(dtype)
 
 
 def _sum_impl(self, dim=None, keepdim=False, *, dtype=None):
@@ -162,7 +219,7 @@ def _sum_impl(self, dim=None, keepdim=False, *, dtype=None):
 
 
 def _mean_cond(self, dim=None, keepdim=False, *, dtype=None):
-    return _base_cond(self, dim) and _supported_out_dtype(dtype)
+    return _base_cond(self, dim, key="mean") and _supported_out_dtype(dtype)
 
 
 def _mean_impl(self, dim=None, keepdim=False, *, dtype=None):
@@ -202,7 +259,7 @@ def _amin_cond(self, dim=(), keepdim=False):
 def _prod_cond(self, dim, keepdim=False, *, dtype=None):
     # First-match-wins leaves the inner-tree prod override its eligible calls, as in
     # _sum_cond; we take what it declines rather than handing those to aten.
-    return _base_cond(self, dim) and _supported_out_dtype(dtype)
+    return _base_cond(self, dim, key="prod") and _supported_out_dtype(dtype)
 
 
 # --- Group B: INDEX reductions. The traits carry the index in a second accumulator field,
@@ -228,6 +285,9 @@ def _idx_width(self, red):
 def _run_arg(make_trait, key, self, red, keepdim):
     # The kernel STORES int64 directly, since a trailing widening cast is a whole extra ~2us
     # launch; the accumulator keeps _idx_width's narrower type so shuffles stay cheap.
+    if self.numel() == 0:
+        # arg* has no identity, so _empty_ok only let this through for an EMPTY output.
+        return _empty_result(self, red, keepdim, [torch.int64], [None])[0]
     acc, _ = _acc_policy()[self.dtype]
     idx_cute, tag = _idx_width(self, red)
     trait = make_trait(acc, idx_cute)
@@ -242,12 +302,16 @@ def _run_arg(make_trait, key, self, red, keepdim):
 def _run_dim2(make_trait, key, self, dim, keepdim):
     # Values keep the input dtype; the index is stored as int64 directly, as in _run_arg. Via
     # _normalize_dims, not `dim % self.dim()`, which is undefined for a 0-dim input.
+    red = _normalize_dims(dim, self.dim())
+    if self.numel() == 0:  # empty output only, as in _run_arg
+        return _empty_result(
+            self, red, keepdim, [self.dtype, torch.int64], [None, None]
+        )
     acc, _ = _acc_policy()[self.dtype]
-    red = {dim % self.dim()}
     idx_cute, tag = _idx_width(self, red)
     trait = make_trait(acc, idx_cute)
-    dts = [self.dtype, torch.int64]
-    vals, idxs = kg.reduce_dim2(trait, key + tag, self, sorted(red), dts)
+    dims = None if red is None else sorted(red)
+    vals, idxs = kg.reduce_dim2(trait, key + tag, self, dims, [self.dtype, torch.int64])
     vals = _keepdim_reshape(vals, self.shape, red, keepdim)
     idxs = _keepdim_reshape(idxs, self.shape, red, keepdim)
     return vals, idxs
@@ -381,20 +445,21 @@ def _std_cond(self, dim=None, *, correction=None, keepdim=False):
 
 
 def _vector_norm_cond(self, ord=2, dim=None, keepdim=False, *, dtype=None):
-    # ord=0 is a nonzero-count, not a |x|**p norm -> let aten handle it.
-    return _base_cond(self, dim) and ord != 0 and _supported_out_dtype(dtype)
+    # ord=0 (the nonzero count) is served via CountNonzeroOps -- see _norm_trait. The key
+    # matches _vector_norm_impl's so the empty-axis identity is looked up for the same ord.
+    return _base_cond(self, dim, key=f"vnorm{ord}") and _supported_out_dtype(dtype)
 
 
-def _all_cond(self, dim, keepdim=False):
-    return _base_cond(self, dim)
+def _all_cond(self, dim=None, keepdim=False):
+    return _base_cond(self, dim, key="all")
 
 
-def _any_cond(self, dim, keepdim=False):
-    return _base_cond(self, dim)
+def _any_cond(self, dim=None, keepdim=False):
+    return _base_cond(self, dim, key="any")
 
 
-def _count_nonzero_cond(self, dim):
-    return _base_cond(self, dim)
+def _count_nonzero_cond(self, dim=None):
+    return _base_cond(self, dim, key="cnz")
 
 
 # --- Group D: two-output VALUE reductions (var_mean / std_mean / aminmax). Same
@@ -404,8 +469,12 @@ def _count_nonzero_cond(self, dim):
 def _run_dim2_vals(make_trait, key, self, dim, keepdim):
     # Both outputs are STORED in the input dtype, as in _run1; accumulation stays fp32.
     # reduce_dim2 takes dims=None directly for reduce-all.
-    acc, _ = _acc_policy()[self.dtype]
     red = _normalize_dims(dim, self.dim())
+    if self.numel() == 0:
+        # aminmax has no identity and var_mean/std_mean decline via _dof_ok, so as in
+        # _run_arg this is reached only for an EMPTY output.
+        return _empty_result(self, red, keepdim, [self.dtype] * 2, [None, None])
+    acc, _ = _acc_policy()[self.dtype]
     dims = None if red is None else sorted(red)
     o0, o1 = kg.reduce_dim2(make_trait(acc), key, self, dims, [self.dtype, self.dtype])
     o0 = _keepdim_reshape(o0, self.shape, red, keepdim)

@@ -87,6 +87,39 @@ class TestCuTeDSLReductionWiring(TestCase):
                     ref = fn(xt)
                 self.assertEqual(fn(xt), ref)
 
+    def test_empty_reduction_is_served_or_declined_by_identity(self):
+        # An empty reduction is an empty tensor (a KEPT extent is zero) or the op's IDENTITY over the
+        # kept shape. The max/min family has none and aten RAISES, so serving it would answer where
+        # aten errors.
+        empty_out = torch.randn(0, 5, device="cuda")
+        empty_axis = torch.randn(5, 0, device="cuda")
+        for fn in (
+            lambda t: t.sum(dim=1),
+            lambda t: t.mean(dim=1),
+            lambda t: torch.prod(t, 1),
+            lambda t: t.all(dim=1),
+            lambda t: torch.count_nonzero(t, dim=1),
+            lambda t: torch.linalg.vector_norm(t, dim=1),
+        ):
+            for x in (empty_out, empty_axis):
+                with self.subTest(fn=fn, shape=tuple(x.shape)):
+                    with _disabled():
+                        ref = fn(x)
+                    got = fn(x)
+                    self.assertEqual(got.shape, ref.shape)
+                    self.assertEqual(got.dtype, ref.dtype)
+                    self.assertEqual(got, ref, exact_dtype=True)
+        # No identity + a non-empty output -> aten must raise, so we must not answer. aten
+        # reports this as an IndexError (TORCH_CHECK_INDEX on the reduced dim).
+        for fn in (torch.amax, torch.amin, torch.argmax, torch.aminmax):
+            with self.subTest(fn=fn):
+                with self.assertRaises((RuntimeError, IndexError)):
+                    fn(empty_axis, dim=1)
+        # ... but the same ops over an EMPTY output are served, since no identity is needed.
+        for fn in (torch.amax, torch.amin, torch.argmax):
+            with self.subTest(fn=fn, empty_out=True):
+                self.assertEqual(fn(empty_out, dim=1).shape, (0,))
+
     @staticmethod
     def _compiled_kernel_count():
         # Every compiled reduction kernel lands in exactly one of these caches, keyed on its
@@ -137,14 +170,30 @@ class TestCuTeDSLReductionWiring(TestCase):
             f"size-derived const_expr has crept back in",
         )
 
-
-    def test_scalar_falls_back(self):
-        # 0-dim input must not crash the cond (regression: d % ndim with ndim==0).
+    def test_scalar_is_served(self):
+        # A 0-dim input reduces to ITSELF and aten accepts exactly dim None/[]/0/-1, so the result is
+        # 0-dim whatever keepdim says. The normalization must not compute `d % ndim` with ndim 0.
         s = torch.tensor(3.5, device="cuda")
-        self.assertEqual(self._fired_count(lambda: torch.sum(s)), 0)
-        with _disabled():
-            ref = torch.sum(s, dim=0, keepdim=True)
-        self.assertEqual(torch.sum(s, dim=0, keepdim=True), ref)
+        for fn in (
+            lambda t: torch.sum(t),
+            lambda t: torch.sum(t, dim=0),
+            lambda t: torch.sum(t, dim=-1),
+            lambda t: torch.sum(t, dim=0, keepdim=True),
+            lambda t: torch.amax(t),
+            lambda t: torch.argmax(t),
+            lambda t: torch.max(t, dim=0),
+            lambda t: torch.aminmax(t, dim=0),
+            lambda t: torch.count_nonzero(t),
+        ):
+            with self.subTest(fn=fn):
+                self.assertGreaterEqual(self._fired_count(lambda: fn(s)), 1)
+                with _disabled():
+                    ref = fn(s)
+                self.assertEqual(fn(s), ref, exact_dtype=True)
+        # An out-of-range or duplicated dim still has to reach aten's error.
+        for bad in (1, -2, [0, -1]):
+            with self.subTest(dim=bad), self.assertRaises((RuntimeError, IndexError)):
+                torch.sum(s, dim=bad)
 
     def test_invalid_dim_defers_to_aten(self):
         # dim args aten rejects (out-of-range / duplicate) must surface aten's
