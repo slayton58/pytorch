@@ -516,7 +516,10 @@ class TestCuTeDSLReductionWiring(TestCase):
             lambda: x + 2.0,
             lambda: x - 2.0,
             lambda: x / 2.0,
-            lambda: torch.fmod(x, 2.0),
+            # torch.fmod(x, 2.0) used to be here. Float fmod/remainder decline now (their
+            # trunc(x/y)*y is inexact for a large quotient -- see the fmod row in
+            # pointwise/table.py), and the four arithmetic ops above already cover the
+            # Tensor-slot scalar coercion this test is about.
         ):
             got = fn()
             with _disabled():
@@ -702,7 +705,10 @@ class TestCuTeDSLReductionWiring(TestCase):
         i = torch.tensor([2, 4, 6], dtype=torch.int32, device="cuda")
         for fn in (
             lambda: 1.0 - t,
-            lambda: torch.remainder(2.0, t),
+            # remainder on INTEGERS: the reflected overload is what this test covers, and
+            # the float form of fmod/remainder now declines (its trunc(x/y)*y is inexact
+            # for a large quotient -- see the fmod row in pointwise/table.py).
+            lambda: torch.remainder(2, i),
             lambda: torch.xlogy(2.0, t),
             lambda: torch.bitwise_and(3, i),
         ):
