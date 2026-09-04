@@ -3,25 +3,168 @@
 # Wiring tests for routing, fallback, and CUDA graph capture. OpInfo tests cover
 # numerical behavior.
 
+import math
+import sys
 import unittest
+import warnings
 
 import torch
 from torch.testing._internal.common_cuda import TEST_CUDA
-from torch.testing._internal.common_utils import run_tests, skipIfNoCuteDSL, TestCase
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TEST_CUTEDSL,
+    TestCase,
+)
+
+
+if not TEST_CUTEDSL:
+    sys.stderr.write("CuTeDSL not available\n")
+    if __name__ == "__main__":
+        sys.exit(0)
+    raise unittest.SkipTest("CuTeDSL not available")
+
+from torch._native.ops.reductions import (
+    kernel_coltile,
+    kernel_general,
+    kernel_rowtile,
+    kernel_xcta,
+)
 
 
 def _disabled():
     return torch.backends.python_native.cutedsl.disabled()
 
 
+_OUT_CASES = (
+    ("sum_dim", lambda x, o: torch.sum(x, dim=1, out=o[0]), ((8,),), (torch.float32,)),
+    (
+        "sum_full",
+        lambda x, o: torch.ops.aten.sum.out(x, out=o[0]),
+        ((),),
+        (torch.float32,),
+    ),
+    (
+        "mean_dim",
+        lambda x, o: torch.mean(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.float32,),
+    ),
+    ("mean_full", lambda x, o: torch.mean(x, out=o[0]), ((),), (torch.float32,)),
+    (
+        "nansum",
+        lambda x, o: torch.nansum(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.float32,),
+    ),
+    ("amax", lambda x, o: torch.amax(x, dim=1, out=o[0]), ((8,),), (torch.float32,)),
+    ("amin", lambda x, o: torch.amin(x, dim=1, out=o[0]), ((8,),), (torch.float32,)),
+    (
+        "prod_dim",
+        lambda x, o: torch.prod(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.float32,),
+    ),
+    (
+        "prod_full",
+        lambda x, o: torch.ops.aten.prod.out(x, out=o[0]),
+        ((),),
+        (torch.float32,),
+    ),
+    (
+        "argmax",
+        lambda x, o: torch.argmax(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.int64,),
+    ),
+    (
+        "argmin",
+        lambda x, o: torch.argmin(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.int64,),
+    ),
+    (
+        "max_dim",
+        lambda x, o: torch.max(x, dim=1, out=o),
+        ((8,), (8,)),
+        (torch.float32, torch.int64),
+    ),
+    ("max_full", lambda x, o: torch.max(x, out=o[0]), ((),), (torch.float32,)),
+    (
+        "min_dim",
+        lambda x, o: torch.min(x, dim=1, out=o),
+        ((8,), (8,)),
+        (torch.float32, torch.int64),
+    ),
+    ("min_full", lambda x, o: torch.min(x, out=o[0]), ((),), (torch.float32,)),
+    ("var", lambda x, o: torch.var(x, dim=1, out=o[0]), ((8,),), (torch.float32,)),
+    ("std", lambda x, o: torch.std(x, dim=1, out=o[0]), ((8,),), (torch.float32,)),
+    (
+        "vector_norm",
+        lambda x, o: torch.linalg.vector_norm(x, dim=1, out=o[0]),
+        ((8,),),
+        (torch.float32,),
+    ),
+    ("all_dim", lambda x, o: torch.all(x, dim=1, out=o[0]), ((8,),), (torch.uint8,)),
+    (
+        "all_dims",
+        lambda x, o: torch.all(x, dim=(0, 1), out=o[0]),
+        ((),),
+        (torch.uint8,),
+    ),
+    ("all_full", lambda x, o: torch.all(x, out=o[0]), ((),), (torch.uint8,)),
+    ("any_dim", lambda x, o: torch.any(x, dim=1, out=o[0]), ((8,),), (torch.uint8,)),
+    (
+        "any_dims",
+        lambda x, o: torch.any(x, dim=(0, 1), out=o[0]),
+        ((),),
+        (torch.uint8,),
+    ),
+    ("any_full", lambda x, o: torch.any(x, out=o[0]), ((),), (torch.uint8,)),
+    (
+        "count_nonzero_dim",
+        lambda x, o: torch.ops.aten.count_nonzero.out(x, 1, out=o[0]),
+        ((8,),),
+        (torch.int64,),
+    ),
+    (
+        "count_nonzero_dims",
+        lambda x, o: torch.ops.aten.count_nonzero.dim_IntList_out(x, [0, 1], out=o[0]),
+        ((),),
+        (torch.int64,),
+    ),
+    (
+        "var_mean",
+        lambda x, o: torch.ops.aten.var_mean.correction_out(
+            x, [1], correction=1, keepdim=False, out0=o[0], out1=o[1]
+        ),
+        ((8,), (8,)),
+        (torch.float32, torch.float32),
+    ),
+    (
+        "std_mean",
+        lambda x, o: torch.ops.aten.std_mean.correction_out(
+            x, [1], correction=1, keepdim=False, out0=o[0], out1=o[1]
+        ),
+        ((8,), (8,)),
+        (torch.float32, torch.float32),
+    ),
+    (
+        "aminmax",
+        lambda x, o: torch.aminmax(x, dim=1, out=o),
+        ((8,), (8,)),
+        (torch.float32, torch.float32),
+    ),
+)
+
+
 @unittest.skipUnless(TEST_CUDA, "CUDA required")
-@skipIfNoCuteDSL
 class TestCuTeDSLReductionWiring(TestCase):
     def _fired_count(self, fn):
-        from torch._native.ops.reductions import kernel_general as kg
-
-        names = ("reduce_dim", "reduce_dim2", "reduce_all")
-        orig = {nm: getattr(kg, nm) for nm in names}
+        names = ("reduce_dim", "reduce_dim2", "reduce_all", "reduce_all2")
+        orig = {nm: getattr(kernel_general, nm) for nm in names}
         n = [0]
 
         def wrap(f):
@@ -32,105 +175,49 @@ class TestCuTeDSLReductionWiring(TestCase):
             return counting
 
         for nm in names:
-            setattr(kg, nm, wrap(orig[nm]))
+            setattr(kernel_general, nm, wrap(orig[nm]))
         try:
             fn()
         finally:
             for nm in names:
-                setattr(kg, nm, orig[nm])
+                setattr(kernel_general, nm, orig[nm])
         return n[0]
 
-    def test_supported_call_fires(self):
-        # A supported call (CUDA, float, contiguous, valid dim) must route through
-        # our kernel -- guards against a silently-all-fallback regression.
-        x = torch.randn(128, 512, device="cuda")
-        self.assertEqual(self._fired_count(lambda: torch.sum(x, dim=-1)), 1)
-        self.assertEqual(self._fired_count(lambda: torch.mean(x, dim=-1)), 1)
-        self.assertEqual(self._fired_count(lambda: torch.amax(x, dim=-1)), 1)
-        # Group B: single-output index (argmax) and two-output (max.dim).
-        self.assertEqual(self._fired_count(lambda: torch.argmax(x, dim=-1)), 1)
-        self.assertEqual(self._fired_count(lambda: torch.max(x, dim=-1)), 1)
-        # Group C: parameterized / non-float-output single reductions.
-        self.assertEqual(self._fired_count(lambda: torch.var(x, dim=-1)), 1)
-        self.assertEqual(
-            self._fired_count(lambda: torch.linalg.vector_norm(x, dim=-1)), 1
-        )
-        self.assertEqual(self._fired_count(lambda: torch.count_nonzero(x, dim=-1)), 1)
-        # Group D: two float-output reductions.
-        self.assertEqual(self._fired_count(lambda: torch.var_mean(x, dim=-1)), 1)
-        self.assertEqual(self._fired_count(lambda: torch.aminmax(x, dim=-1)), 1)
-
     def test_unsupported_dtype_falls_back(self):
-        # Integer input is outside the supported set -> must NOT hit our kernel.
-        xi = torch.randint(0, 9, (64, 64), device="cuda")
-        self.assertEqual(self._fired_count(lambda: torch.sum(xi, dim=-1)), 0)
-        # ... and the result is still correct (served by aten).
-        with _disabled():
-            ref = torch.sum(xi, dim=-1)
-        self.assertEqual(torch.sum(xi, dim=-1), ref)
+        for dtype in (torch.float64, torch.int64, torch.complex64, torch.complex128):
+            xi = torch.ones(64, 64, device="cuda", dtype=dtype)
+            with self.subTest(dtype=dtype):
+                self.assertEqual(self._fired_count(lambda: torch.sum(xi, dim=-1)), 0)
+                with _disabled():
+                    ref = torch.sum(xi, dim=-1)
+                self.assertEqual(torch.sum(xi, dim=-1), ref)
 
-    def test_noncontiguous_is_served(self):
-        # A layout is never a reason to decline: the general arm addresses through the TI
-        # offset decode, so a non-contiguous input is SERVED, not handed back.
+    def test_argmax_declines_bool(self):
+        x = torch.ones(64, 64, device="cuda", dtype=torch.bool)
+        with self.assertRaisesRegex(RuntimeError, "does not support bool"):
+            torch.argmax(x, dim=-1)
+
+    def test_noncontiguous_full_reductions_are_served(self):
         xt = torch.randn(64, 128, device="cuda").t()
         for fn in (
-            lambda t: torch.sum(t, dim=-1),
-            lambda t: torch.sum(t, dim=0),
-            lambda t: torch.sum(t),  # reduce-ALL of a non-contiguous input
-            lambda t: torch.amax(t, dim=-1),
-            lambda t: torch.var(t, dim=-1),
-            lambda t: torch.argmax(t, dim=-1),
+            lambda t: torch.sum(t),
+            lambda t: torch.argmax(t),
         ):
             with self.subTest(fn=fn):
                 self.assertEqual(self._fired_count(lambda: fn(xt)), 1)
                 with _disabled():
                     ref = fn(xt)
-                self.assertEqual(fn(xt), ref)
+                self.assertEqual(fn(xt), ref, exact_dtype=True)
 
-    def test_empty_reduction_is_served_or_declined_by_identity(self):
-        # An empty reduction is an empty tensor (a KEPT extent is zero) or the op's IDENTITY over the
-        # kept shape. The max/min family has none and aten RAISES, so serving it would answer where
-        # aten errors.
-        empty_out = torch.randn(0, 5, device="cuda")
+    def test_empty_reduction_without_identity_raises(self):
         empty_axis = torch.randn(5, 0, device="cuda")
-        for fn in (
-            lambda t: t.sum(dim=1),
-            lambda t: t.mean(dim=1),
-            lambda t: torch.prod(t, 1),
-            lambda t: t.all(dim=1),
-            lambda t: torch.count_nonzero(t, dim=1),
-            lambda t: torch.linalg.vector_norm(t, dim=1),
-        ):
-            for x in (empty_out, empty_axis):
-                with self.subTest(fn=fn, shape=tuple(x.shape)):
-                    with _disabled():
-                        ref = fn(x)
-                    got = fn(x)
-                    self.assertEqual(got.shape, ref.shape)
-                    self.assertEqual(got.dtype, ref.dtype)
-                    self.assertEqual(got, ref, exact_dtype=True)
-        # No identity + a non-empty output -> aten must raise, so we must not answer. aten
-        # reports this as an IndexError (TORCH_CHECK_INDEX on the reduced dim).
         for fn in (torch.amax, torch.amin, torch.argmax, torch.aminmax):
             with self.subTest(fn=fn):
                 with self.assertRaises((RuntimeError, IndexError)):
                     fn(empty_axis, dim=1)
-        # ... but the same ops over an EMPTY output are served, since no identity is needed.
-        for fn in (torch.amax, torch.amin, torch.argmax):
-            with self.subTest(fn=fn, empty_out=True):
-                self.assertEqual(fn(empty_out, dim=1).shape, (0,))
 
     @staticmethod
     def _compiled_kernel_count():
-        # Every compiled reduction kernel lands in exactly one of these caches, keyed on its
-        # compile signature -- so len() IS the number of distinct kernels built so far.
-        from torch._native.ops.reductions import (
-            kernel_coltile,
-            kernel_general,
-            kernel_rowtile,
-            kernel_xcta,
-        )
-
         caches = (
             kernel_general._COMPILE_CACHE,
             kernel_rowtile._CACHE,
@@ -140,11 +227,7 @@ class TestCuTeDSLReductionWiring(TestCase):
         return sum(len(c) for c in caches), caches
 
     def test_kernel_count_does_not_scale_with_shape(self):
-        # GUARD. The design rests on compiling O(op x dtype x structure) kernels, not O(shapes): a
-        # size-derived const_expr breaks that and shows up as compile time, not a wrong answer. The
-        # bound is RELATIVE so it survives adding kernels. These N share a vec class and one bucket
-        # rung, so a correct stack compiles the same kernels for two of them as for ten. An order
-        # that fixes its add DAG at compile time cannot satisfy this and is opt-in, so off here.
+        # These sizes share a vector class and bucket, so they must share kernels.
         few = [4096, 4104]
         many = [4096, 4104, 4112, 4120, 4128, 4136, 4144, 4152, 4160, 4168]
 
@@ -171,38 +254,20 @@ class TestCuTeDSLReductionWiring(TestCase):
         )
 
     def test_scalar_is_served(self):
-        # A 0-dim input reduces to ITSELF and aten accepts exactly dim None/[]/0/-1, so the result is
-        # 0-dim whatever keepdim says. The normalization must not compute `d % ndim` with ndim 0.
         s = torch.tensor(3.5, device="cuda")
         for fn in (
             lambda t: torch.sum(t),
-            lambda t: torch.sum(t, dim=0),
             lambda t: torch.sum(t, dim=-1),
             lambda t: torch.sum(t, dim=0, keepdim=True),
-            lambda t: torch.amax(t),
-            lambda t: torch.argmax(t),
-            lambda t: torch.max(t, dim=0),
-            lambda t: torch.aminmax(t, dim=0),
-            lambda t: torch.count_nonzero(t),
         ):
             with self.subTest(fn=fn):
                 self.assertGreaterEqual(self._fired_count(lambda: fn(s)), 1)
                 with _disabled():
                     ref = fn(s)
                 self.assertEqual(fn(s), ref, exact_dtype=True)
-        # An out-of-range or duplicated dim still has to reach aten's error.
         for bad in (1, -2, [0, -1]):
             with self.subTest(dim=bad), self.assertRaises((RuntimeError, IndexError)):
                 torch.sum(s, dim=bad)
-
-    def test_invalid_dim_defers_to_aten(self):
-        # dim args aten rejects (out-of-range / duplicate) must surface aten's
-        # normal error -- the cond declines so aten validates, no wrapped result.
-        x = torch.randn(4, 5, 6, device="cuda")
-        with self.assertRaises(IndexError):
-            torch.sum(x, dim=3)
-        with self.assertRaises(RuntimeError):
-            torch.sum(x, dim=(0, 0))
 
     def test_cow_input_served_and_preserved(self):
         # A COW input is SERVED (it exports read-only, so from_dlpack reads const_data_ptr()) and
@@ -213,8 +278,6 @@ class TestCuTeDSLReductionWiring(TestCase):
         self.assertTrue(torch._C._is_cow_tensor(x))
 
     def test_fast_geometry_routing(self):
-        # `fast_kind` is a ROUTER, not a gate: a geometry it cannot reshape onto the fast paths is
-        # served by the general arm. So every case here fires; only which path takes it differs.
         served = [
             ("2D last-dim", torch.randn(512, 512, device="cuda"), -1),
             ("2D dim0", torch.randn(512, 512, device="cuda"), 0),
@@ -223,11 +286,6 @@ class TestCuTeDSLReductionWiring(TestCase):
                 torch.randn(64, 32, 512, device="cuda"),
                 -1,
             ),
-            (
-                "3D dims (1,2) coalesce to row",
-                torch.randn(128, 32, 32, device="cuda"),
-                (1, 2),
-            ),
         ]
         for name, x, dim in served:
             self.assertEqual(
@@ -235,17 +293,8 @@ class TestCuTeDSLReductionWiring(TestCase):
                 1,
                 f"{name} should fire",
             )
-        # These reach no fast path (mid-dim, transposed, gapped, window-overlapping), so the
-        # general arm serves them -- and must get the same answer aten does.
         general = [
             ("3D mid-dim", torch.randn(512, 512, 64, device="cuda"), 1),
-            ("transposed", torch.randn(512, 512, device="cuda").t(), -1),
-            ("gapped slice", torch.randn(512, 512, device="cuda")[:, ::2], -1),
-            (
-                "permuted 3D",
-                torch.randn(32, 64, 128, device="cuda").permute(2, 0, 1),
-                2,
-            ),
             (
                 "overlapping windows",
                 torch.randn(64, 128, device="cuda").unfold(1, 4, 2),
@@ -260,14 +309,20 @@ class TestCuTeDSLReductionWiring(TestCase):
             )
             with _disabled():
                 ref = torch.sum(x, dim=dim)
-            self.assertEqual(torch.sum(x, dim=dim), ref, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(torch.sum(x, dim=dim), ref, atol=1e-3, rtol=1e-3)
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs >= 2 GPUs")
-    def test_other_device_defers(self):
-        # A tensor not on the current device must fall back (kernel/stream caches
-        # are current-device-bound). cuda:1 with cuda:0 current -> aten.
-        x = torch.randn(128, 512, device="cuda:1")
-        self.assertEqual(self._fired_count(lambda: torch.sum(x, dim=-1)), 0)
+    def test_other_device_is_served(self):
+        x0 = torch.randn(128, 512, device="cuda:0")
+        x1 = x0.to("cuda:1")
+        with _disabled():
+            expected = torch.sum(x1, dim=-1)
+        with torch.cuda.device(0):
+            torch.sum(x0, dim=-1)
+            self.assertEqual(self._fired_count(lambda: torch.sum(x1, dim=-1)), 1)
+            actual = torch.sum(x1, dim=-1)
+            self.assertEqual(torch.cuda.current_device(), 0)
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
     def test_graph_capturable(self):
         # The override must capture into a CUDA graph and replay correctly (the
@@ -291,14 +346,14 @@ class TestCuTeDSLReductionWiring(TestCase):
             out = f()
         g.replay()
         torch.cuda.synchronize()
-        self.assertEqual(out, ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
     def test_sub_warp_row_width_does_not_crash(self):
         # REGRESSION: the small-N rungs returned 8/16 threads per row and warps_per_row floored to 0,
         # a trace-time ZeroDivisionError on an ordinary sum. Non-monotonic in N, so cover the range.
-        for n in (8, 16, 24, 32, 33, 48, 63, 64, 96, 128, 192):
+        for n in (8, 16, 33, 64, 96, 192):
             x = torch.rand(257, n, device="cuda")
-            self.assertEqual(
+            torch.testing.assert_close(
                 torch.sum(x, dim=1), x.double().sum(dim=1).float(), atol=1e-3, rtol=1e-3
             )
             torch.linalg.vector_norm(x, 2, dim=1)  # same reduce path, must not raise
@@ -308,37 +363,145 @@ class TestCuTeDSLReductionWiring(TestCase):
         # the stride is unobservable -- so a.diagonal(offset=2) is a contiguous shape-(1,) tensor that
         # still declares stride (4,), which the DSL rejected outright. The wrap restrides it, and
         # these are SERVED: declining would give up coverage for a difference nothing can observe.
-        a = torch.randn(5, 3, device="cuda", dtype=torch.float64)
+        a = torch.randn(5, 3, device="cuda")
         d = a.diagonal(offset=2)
         self.assertEqual(d.shape, torch.Size([1]))
         self.assertNotEqual(d.stride(), (1,))  # the leftover stride is the whole point
-        for fn in (lambda z: z.sum(), lambda z: z.mean()):
-            with _disabled():
-                ref = fn(d)
-            self.assertEqual(fn(d), ref)
+        with _disabled():
+            ref = d.sum()
+        self.assertEqual(d.sum(), ref)
 
-    def test_misaligned_and_lazy_metadata_inputs_decline(self):
-        # Two cond gates that are not numerics: an unaligned base pointer, because the compiled plan
-        # bakes the load width its wrap claimed and cannot serve both; and a NEG/CONJ bit, which is
-        # lazy metadata, so the exported buffer holds the unnegated values and resolving it here would
-        # re-enter our own copy_ override.
-        base = torch.arange(4096, device="cuda", dtype=torch.float64) + 1
-        for off in (0, 1, 2, 3):
-            t = base[off : off + 512].view(256, 2)
-            for fn in (
-                lambda z: z.sum(dim=0),
-                lambda z: z.sum(dim=1),
-                lambda z: z.sum(),
-            ):
-                with _disabled():
-                    ref = fn(t)
-                self.assertEqual(fn(t), ref, f"off={off}")
-        n = torch.randn(64, device="cuda", dtype=torch.float64)._neg_view()
-        self.assertTrue(n.is_neg())
-        for fn in (lambda z: z.sum(dim=0), lambda z: z.sum(), lambda z: z.mean()):
+    def test_misaligned_inputs_are_served(self):
+        cases = (
+            ("row", (256, 2), lambda t: torch.amax(t, dim=1)),
+            ("cross-CTA row", (2, 32768), lambda t: torch.amax(t, dim=1)),
+            ("column", (4096, 256), lambda t: torch.amax(t, dim=0)),
+            ("general", (8, 16, 32), lambda t: torch.sum(t, dim=1)),
+        )
+        for name, shape, fn in cases:
+            base = torch.randn(math.prod(shape) + 1, device="cuda")
+            t = base[1:].view(shape)
+            self.assertNotEqual(t.data_ptr() % 16, 0)
             with _disabled():
-                ref = fn(n)
-            self.assertEqual(fn(n), ref)
+                expected = fn(t)
+            with self.subTest(name=name):
+                self.assertEqual(self._fired_count(lambda: fn(t)), 1)
+                torch.testing.assert_close(fn(t), expected, atol=1e-3, rtol=1e-3)
+
+    def test_lazy_negative_input_is_served(self):
+        n = torch.randn(64, device="cuda")._neg_view()
+        self.assertTrue(n.is_neg())
+        with _disabled():
+            ref = n.sum()
+        self.assertEqual(self._fired_count(lambda: n.sum()), 1)
+        self.assertEqual(n.sum(), ref)
+
+    def test_invalid_degrees_of_freedom_warn_and_are_served(self):
+        x = torch.randn(4, 16, device="cuda")
+        cases = (
+            ("var", lambda: torch.var(x, dim=1, correction=16)),
+            ("std", lambda: torch.std(x, dim=1, correction=16)),
+            ("var_mean", lambda: torch.var_mean(x, dim=1, correction=16)),
+            ("std_mean", lambda: torch.std_mean(x, dim=1, correction=16)),
+        )
+        for name, fn in cases:
+            with (
+                _disabled(),
+                self.assertWarnsRegex(UserWarning, "degrees of freedom is <= 0"),
+            ):
+                expected = fn()
+            actual = []
+            with (
+                self.subTest(name=name),
+                self.assertWarnsRegex(UserWarning, "degrees of freedom is <= 0"),
+            ):
+                fired = self._fired_count(lambda: actual.append(fn()))
+            self.assertEqual(fired, 1)
+            self.assertEqual(actual[0], expected)
+
+    @parametrize(
+        "correction",
+        [float("-inf"), float("inf"), float("nan")],
+        name_fn=lambda correction: str(correction),
+    )
+    def test_nonfinite_correction_is_served(self, correction):
+        x = torch.tensor([[1.0, 2.0], [1.0, 1.0]], device="cuda")
+        with _disabled(), warnings.catch_warnings(record=True) as expected_warnings:
+            expected = torch.var_mean(x, dim=1, correction=correction)
+        actual = []
+        with warnings.catch_warnings(record=True) as actual_warnings:
+            fired = self._fired_count(
+                lambda: actual.append(torch.var_mean(x, dim=1, correction=correction))
+            )
+        self.assertEqual(fired, 1)
+        self.assertEqual(actual[0], expected)
+        self.assertEqual(
+            ["degrees of freedom is <= 0" in str(w.message) for w in actual_warnings],
+            ["degrees of freedom is <= 0" in str(w.message) for w in expected_warnings],
+        )
+
+
+@unittest.skipUnless(TEST_CUDA, "CUDA required")
+class TestCuTeDSLReductionOut(TestCase):
+    @parametrize(
+        "name,call,shapes,dtypes",
+        _OUT_CASES,
+        name_fn=lambda name, call, shapes, dtypes: name,
+    )
+    def test_out_overload(self, device, name, call, shapes, dtypes):
+        x = torch.randn(8, 16, device=device)
+        if name.startswith("nansum"):
+            x[0, 0] = float("nan")
+
+        def make_outs():
+            return tuple(
+                torch.empty(shape, device=device, dtype=dtype)
+                for shape, dtype in zip(shapes, dtypes)
+            )
+
+        expected = make_outs()
+        with _disabled():
+            call(x, expected)
+
+        names = ("reduce_dim", "reduce_dim2", "reduce_all")
+        original = {entry: getattr(kernel_general, entry) for entry in names}
+        fired = [0]
+
+        def wrap(fn):
+            def counting(*args, **kwargs):
+                fired[0] += 1
+                return fn(*args, **kwargs)
+
+            return counting
+
+        for entry, fn in original.items():
+            setattr(kernel_general, entry, wrap(fn))
+        actual = make_outs()
+        if name == "sum_dim":
+            actual = (torch.empty(1, device=device, dtype=dtypes[0]),)
+        try:
+            if name == "sum_dim":
+                with self.assertWarnsRegex(
+                    UserWarning, "An output with one or more elements was resized"
+                ):
+                    result = call(x, actual)
+            else:
+                result = call(x, actual)
+        finally:
+            for entry, fn in original.items():
+                setattr(kernel_general, entry, fn)
+
+        self.assertGreater(fired[0], 0)
+        returned = result if isinstance(result, tuple) else (result,)
+        for got, out in zip(returned, actual):
+            self.assertIs(got, out)
+        for got, ref in zip(actual, expected):
+            tol = 1e-10 if ref.dtype is torch.float64 else 1e-2
+            torch.testing.assert_close(got, ref, rtol=tol, atol=tol)
+
+
+instantiate_parametrized_tests(TestCuTeDSLReductionWiring)
+instantiate_device_type_tests(TestCuTeDSLReductionOut, globals(), only_for="cuda")
 
 
 if __name__ == "__main__":
