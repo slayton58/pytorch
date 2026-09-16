@@ -271,9 +271,9 @@ def fast_kind(red_pairs: Pairs, kept_pairs: Pairs, nouts: int) -> str | None:
 
 # Largest one-block register-loaded row; only merging uses smem. Larger uses multi-CTA.
 _MAX_ROW_BYTES = 192 * 1024
-# Bound loads when odd or prime N collapses vector width. 64 separates measured wins from
-# losses; routing beyond it improved 0.08-0.17x to 1.93-2.41x of ATen.
-_ONESHOT_MAX_LOADS = 64
+# Bound loads when odd or prime N collapses vector width. Width 4097 needs 65 scalar
+# loads for 16-bit inputs; keeping it on rowtile measured 41us instead of 102us.
+_ONESHOT_MAX_LOADS = 65
 # Minimum reduced elements per output before a cross-CTA split is worth its second launch.
 _SPLIT_MIN_COUNT = 256
 _WIDE_SPLIT_MIN_BYTES = 32 * 1024 * 1024

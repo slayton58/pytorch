@@ -10,7 +10,7 @@ from cutlass import Int32
 
 import torch
 
-from ...cutedsl import launch as _L
+from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import cute2torch, torch2cute
 from ...cutedsl.plan_cache import cached_plan
 from . import tile
@@ -49,6 +49,8 @@ _CHUNK_LADDER = ((65536, 32), (16384, 16), (4096, 6))
 # 7001 GB/s at N=16 versus 4584 at N=32. TMA with smem rotation gains 1.49-1.86x;
 # the rotation mask requires power-of-two fp32 N.
 _TMA_MIN_STRIDE = 128
+# H100 direct loads win below this; wider one-thread rows need TMA.
+_HOPPER_DIRECT_ROW_BYTES = 384
 
 
 def narrow_row(N: int, itemsize: int, M: int) -> bool:
@@ -75,18 +77,32 @@ def tma_ok(
         return False
     if device is not None:
         # This runs before every plan lookup; memoize the ~1.3us device query.
-        from ...cutedsl import hw_caps as _hw
-
         if _hw.caps(device).cc[0] < 9:
             return False  # TMA is sm_90+
     return True
 
 
+def one_thread_row_ok(
+    N: int,
+    itemsize: int,
+    M: int,
+    device: torch.device | int | str,
+) -> bool:
+    if not narrow_row(N, itemsize, M):
+        return False
+    return (
+        _hw.caps(device).cc != (9, 0)
+        or N * itemsize < _HOPPER_DIRECT_ROW_BYTES
+        or tma_ok(N, itemsize, M, device)
+    )
+
+
 # --- INNER-TREE ORDER (opt-in) --- Unlike launch-shape orders, this fixes the DAG from N,
 # making it hash-pinnable, and covers every N to prevent silent fallback. It costs
-# 0.92-1.41x the rolled fold and requires per-N compilation. Its independent env var avoids
-# affecting upstream kernels, which register first.
+# 0.92-1.41x the rolled fold and requires per-N compilation. The native gate is live for tests;
+# the published sum gate also selects this order for geometries its adapter cannot serve.
 _INNER_TREE_ENV = "PYTORCH_NATIVE_INNER_TREE"
+_SUM_INNER_TREE_ENV = "PYTORCH_SUM_INNER_TREE"
 # Block size for both one-thread-per-row shapes and fixed multirow carry cap.
 _MULTIROW_ROWS_PER_BLOCK = 128
 _MULTIROW_MAX_DEPTH = 6
