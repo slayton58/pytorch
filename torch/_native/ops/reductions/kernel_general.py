@@ -533,7 +533,13 @@ def _try_indexed_itree(
     _launch(s1, key1, [_flat(x)], parts)
 
     outs = [torch.empty(num_o, device=x.device, dtype=d) for d in out_dtypes]
-    combine = rt.itree_combine_plan(plan, parts[0].element_size(), x.device)
+    combine = rt.itree_combine_plan(
+        plan,
+        parts[0].element_size(),
+        x.device,
+        nfields=trait.nfields,
+        nrows=num_o,
+    )
     s2 = ReduceBlock(
         trait,
         count=nbatch,

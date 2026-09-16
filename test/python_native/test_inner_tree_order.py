@@ -8,6 +8,7 @@ import os
 import sys
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 import torch
 from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA
@@ -192,6 +193,49 @@ class TestInnerTreeOrder(TestCase):
                     f"{(m, n)}: signed zero differs from upstream",
                 )
 
+    def test_staged_split_preserves_reduction_trees(self):
+        if not rt._itree_arch(torch.device("cuda")).split_stage_rows:
+            self.skipTest("split staging is disabled on this architecture")
+        m, n = 3, 1 << 18
+        x = torch.randn(m, n, device="cuda")
+        self.assertEqual(rt.itree_plan(n + 1, m, 4, device=x.device).stage_e, 0)
+        self.assertEqual(rt.itree_plan(n, m, 8, device=x.device).stage_e, 0)
+        cases = (
+            ("float16_sum", T.SumOps(), x.to(torch.float16), [torch.float16]),
+            ("bfloat16_sum", T.SumOps(), x.to(torch.bfloat16), [torch.bfloat16]),
+            ("prod", T.ProdOps(), 1 + x / (8 * n**0.5), [torch.float32]),
+            ("var_mean", T.VarMeanOps(), x, [torch.float32, torch.float32]),
+        )
+        for name, trait, src, out_dtypes in cases:
+            with self.subTest(op=name):
+                staged = rt.itree_plan(n, m, src.element_size(), device=x.device)
+                unstaged = rt.itree_plan(
+                    n, m, src.element_size(), stage=False, device=x.device
+                )
+                self.assertGreater(staged.stage_e, 0)
+                got = rt._run_itree(
+                    trait,
+                    f"staged_split_{name}",
+                    src,
+                    out_dtypes,
+                    staged,
+                    len(out_dtypes),
+                )
+                ref = rt._run_itree(
+                    trait,
+                    f"unstaged_split_{name}",
+                    src,
+                    out_dtypes,
+                    unstaged,
+                    len(out_dtypes),
+                )
+                torch.cuda.synchronize()
+                for actual, expected in zip(got, ref):
+                    self.assertEqual(
+                        actual.cpu().view(torch.uint8),
+                        expected.cpu().view(torch.uint8),
+                    )
+
     def test_order_is_reproducible_across_batch(self):
         # An N-only DAG makes each row independent of batch size, unlike the default order.
         n = 4096
@@ -215,6 +259,73 @@ class TestInnerTreeOrder(TestCase):
                     torch.equal(sub.view(torch.int32), whole[:m].view(torch.int32)),
                     f"rows={m}: the order's bits changed with the batch size",
                 )
+
+    def test_every_per_arch_knob_set_gives_the_same_bits(self):
+        shapes = [(8, 1048576), (256, 65536), (65536, 32)]
+        entries = dict(rt._ITREE_ARCH)
+        configs = tuple(dict.fromkeys(entries.values()))
+        hashes = {}
+        for i, entry in enumerate(configs):
+            for m, n in shapes:
+                torch.manual_seed(0)
+                x = torch.randn(m, n, device="cuda")
+                ref = torch.empty(m, device="cuda")
+                up.inner_tree_sum_into(ref, x)
+                with mock.patch.dict(
+                    rt._ITREE_ARCH, dict.fromkeys(entries, entry), clear=False
+                ):
+                    rt._CACHE.clear()
+                    (got,) = rt.reduce_row_tile(
+                        T.SumOps(acc=cutlass.Float32),
+                        f"arch{i}",
+                        x,
+                        [torch.float32],
+                        order="inner_tree",
+                    )
+                    plan = rt.itree_plan(n, m, 4, device=x.device)
+                    combine = (
+                        rt.itree_combine_plan(plan, 4, x.device, nrows=m)
+                        if plan.shape == "split"
+                        else None
+                    )
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    got.view(torch.int32),
+                    ref.view(torch.int32),
+                    f"arch config {i} at ({m}, {n}) [{plan.shape}] differs",
+                )
+                hashes[(i, m, n)] = (
+                    plan.rows_per_block,
+                    plan.stage_rows,
+                    None if combine is None else combine.rows_per_block,
+                    None if combine is None else combine.combine_grp,
+                    None if combine is None else combine.combine_tile,
+                )
+        rt._CACHE.clear()
+
+        plans = {
+            tuple(hashes[(i, m, n)] for m, n in shapes) for i in range(len(configs))
+        }
+        self.assertEqual(
+            len(plans), len(configs), "architecture knobs did not change any plan"
+        )
+        self.assertIn(rt._itree_arch(torch.device("cuda")), entries.values())
+        self.assertEqual(set(entries), {"default", (9, 0), (10, 0)})
+
+    def test_async_combine_short_blocks_match_upstream(self):
+        n = 1 << 20
+        for m in (1, 33):
+            with self.subTest(rows=m):
+                torch.manual_seed(0)
+                x = torch.randn(m, n, device="cuda")
+                plan = rt.itree_plan(n, m, 4, device=x.device)
+                combine = rt.itree_combine_plan(plan, 4, x.device, nrows=m)
+                self.assertGreater(combine.combine_tile, 0)
+                got = self._run(T.SumOps, x)
+                ref = torch.empty(m, device="cuda")
+                up.inner_tree_sum_into(ref, x)
+                torch.cuda.synchronize()
+                self.assertEqual(got.view(torch.int32), ref.view(torch.int32))
 
     def test_no_plan_pairs_an_exact_tile_with_a_bound_or_an_offset_base(self):
         # Exact only covers the tile's N from column 0; a bound or offset invalidates its
@@ -301,6 +412,57 @@ class TestInnerTreeOrder(TestCase):
                     f"({m}, {n}) [{rt.itree_plan(n, m, 4).shape}]: the dispatcher served this "
                     "with the launch-shape order while the gate was on",
                 )
+
+    def test_indexed_reduction_dims_preserve_the_order(self):
+        x0 = torch.randn(4097, 8, device="cuda")
+        base = torch.randn(8, 65538, device="cuda")
+        x2 = torch.randn(5, 7, 9, device="cuda")
+        cases = [
+            ("dim0", T.SumOps, x0, [0], x0.t().contiguous()),
+            ("strided", T.SumOps, base[:, ::2], [1], base[:, ::2].contiguous()),
+            (
+                "welford_strided",
+                T.WelfordOps,
+                base[:4, ::2],
+                [1],
+                base[:4, ::2].contiguous(),
+            ),
+            (
+                "full_strided",
+                T.SumOps,
+                base[:4, ::2],
+                None,
+                base[:4, ::2].contiguous().reshape(1, -1),
+            ),
+            (
+                "multidim",
+                T.SumOps,
+                x2,
+                [0, 2],
+                x2.permute(1, 0, 2).contiguous().reshape(7, 45),
+            ),
+        ]
+        for name, trait, x, dims, rows in cases:
+            with self.subTest(name=name):
+                want = self._run(trait, rows)
+                with _order_on():
+                    got = kg.reduce_dim(
+                        trait(acc=cutlass.Float32),
+                        f"inner_tree_test_indexed_{name}",
+                        x,
+                        dims,
+                        torch.float32,
+                    )
+                self.assertEqual(
+                    got.reshape(-1).view(torch.int32), want.view(torch.int32)
+                )
+
+    def test_ragged_plan_fusion_is_trait_aware(self):
+        n, m = 4097, 4096
+        default = rt.itree_plan(n, m, 2)
+        lowp = rt.trait_itree_plan(T.SumOps(), n, m, 2)
+        self.assertEqual(default.kchunk, 4)
+        self.assertEqual(lowp.kchunk, 2)
 
     def test_multi_field_and_two_output_traits_under_the_order(self):
         # Exercise per-field staging/partials, two outputs from one accumulator, and ragged

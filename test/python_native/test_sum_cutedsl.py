@@ -274,6 +274,13 @@ class TestSumCuteDSLOverride(TestCase):
         got = x.sum(dim=1)
         self.assertEqual(got, ref)
 
+    def test_lazy_negative_input(self):
+        x = torch.randn(128, 8192, device="cuda")._neg_view()
+        self.assertTrue(cutedsl_impl._cond(x, [1]))
+        with torch.backends.python_native.cutedsl.disabled():
+            expected = x.sum(dim=1)
+        torch.testing.assert_close(x.sum(dim=1), expected, atol=1e-4, rtol=1e-4)
+
     def test_override_out_variant(self):
         x = self._make_order_sensitive_input(128, 8192, torch.float32)
         with torch.backends.python_native.cutedsl.disabled():
