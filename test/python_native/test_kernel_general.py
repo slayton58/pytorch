@@ -88,6 +88,15 @@ class TestKernelGeneral(TestCase):
         )
         self.assertEqual(idx, torch.full((8,), 40000, device="cuda", dtype=torch.int32))
 
+    def test_reduce_all_storage_offset(self):
+        storage = torch.zeros(65538, device="cuda")
+        storage[1] = 1
+        x = storage[1:]
+        out = kg.reduce_all(
+            T.ArgMaxOps(acc=cutlass.Float32), "offset_all", x, torch.int32
+        )
+        self.assertEqual(out, torch.zeros((), device="cuda", dtype=torch.int32))
+
     def test_int64_mixed_radix_decode(self):
         cases = (
             (False, (65537, 65539), (3, 5), (1 << 31) + 17),

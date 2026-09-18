@@ -15,7 +15,7 @@ from torch._tensor_iterator import reduce_op
 from ...cutedsl import hw_caps as _hw, launch as _L
 from ...cutedsl.dtypes import cute2torch, torch2cute
 from ...cutedsl.plan_cache import cached_plan
-from . import tile
+from . import _storage, tile
 from .traits import WARP
 
 
@@ -236,7 +236,7 @@ def _probe(x: torch.Tensor, red_axes: set[int]) -> torch.Tensor:
 
 def _flat(x: torch.Tensor) -> torch.Tensor:
     # View all storage at stride one because TI strides are storage-relative; reshape could copy.
-    storage_view = torch.view_as_real(x) if x.is_complex() else x
+    storage_view = _storage.real_view(x)
     n = max(
         storage_view.untyped_storage().nbytes() // storage_view.element_size(),
         1,
@@ -245,8 +245,7 @@ def _flat(x: torch.Tensor) -> torch.Tensor:
 
 
 def _kernel_out(out: torch.Tensor) -> torch.Tensor:
-    storage_view = torch.view_as_real(out) if out.is_complex() else out
-    return storage_view.reshape(-1)
+    return _storage.flat_view(out)
 
 
 def _kernel_outs(outs: Sequence[torch.Tensor]) -> list[torch.Tensor]:
@@ -257,16 +256,46 @@ def _kernel_outs(outs: Sequence[torch.Tensor]) -> list[torch.Tensor]:
 
 
 def fast_kind(red_pairs: Pairs, kept_pairs: Pairs, nouts: int) -> str | None:
-    """Select row or single-output column reduction by a dense 2D TI view's stride-one pair."""
+    """Select row or column reduction by a dense 2D TI view's stride-one pair."""
     if len(kept_pairs) == 0:
         return "all"
     if len(red_pairs) != 1 or len(kept_pairs) != 1:
         return None
     if red_pairs[0][1] == 1:  # reduced run is innermost/contiguous -> row
         return "row"
-    if kept_pairs[0][1] == 1 and nouts == 1:  # kept innermost -> col
+    if kept_pairs[0][1] == 1 and nouts in (1, 2):  # kept innermost -> col
         return "col"
     return None
+
+
+def _physical_col_view(
+    x: torch.Tensor,
+    red_axes: set[int],
+    red_pairs: Pairs,
+    kept_pairs: Pairs,
+    count: int,
+    num_o: int,
+) -> torch.Tensor | None:
+    if red_pairs == [(count, num_o)] and kept_pairs == [(num_o, 1)]:
+        return torch.as_strided(
+            x,
+            (count, num_o),
+            (num_o, 1),
+            storage_offset=x.storage_offset(),
+        )
+    dims = sorted(red_axes)
+    if (
+        not x.is_contiguous()
+        or not dims
+        or dims != list(range(dims[0], dims[-1] + 1))
+        or dims[0] == 0
+        or dims[-1] + 1 == x.dim()
+    ):
+        return None
+    B = math.prod(x.shape[: dims[0]])
+    R = math.prod(x.shape[dims[0] : dims[-1] + 1])
+    C = math.prod(x.shape[dims[-1] + 1 :])
+    return x.reshape(B, R, C)
 
 
 # Largest one-block register-loaded row; only merging uses smem. Larger uses multi-CTA.
@@ -318,7 +347,13 @@ def _try_fast_row(
     ordered = rt.inner_tree_order_enabled()
     if ordered and rt.itree_plan(N, M, itemsize, device=x.device) is not None:
         return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts)
-    if not ordered and rt.one_thread_row_ok(N, itemsize, M, x.device):
+    if not ordered and rt.one_thread_row_ok(
+        N,
+        itemsize,
+        M,
+        x.device,
+        itemsize // 2 if x.is_complex() else itemsize,
+    ):
         return rt.reduce_row_tile(
             trait, trait_key, x, out_dtypes, nouts=nouts, threads_per_row=1
         )
@@ -457,6 +492,7 @@ def _two_stage_general(
 
 
 def _indexed_itree_plan(
+    trait: Any,
     count: int,
     num_o: int,
     itemsize: int,
@@ -464,7 +500,9 @@ def _indexed_itree_plan(
 ) -> "_ItreePlan | None":
     from . import kernel_rowtile as rt
 
-    plan = rt.itree_plan(count, num_o, itemsize, stage=False, device=device)
+    plan = rt.trait_itree_plan(
+        trait, count, num_o, itemsize, stage=False, device=device
+    )
     if plan is None:
         return None
     # General addressing cannot stage physically adjacent rows.
@@ -485,7 +523,7 @@ def _try_indexed_itree(
     """Apply the fixed logical-row DAG through arbitrary storage strides."""
     from . import kernel_rowtile as rt
 
-    plan = _indexed_itree_plan(count, num_o, x.element_size(), x.device)
+    plan = _indexed_itree_plan(trait, count, num_o, x.element_size(), x.device)
     if plan is None:
         return None
     nbatch = plan.split[0] if plan.shape == "split" else 1
@@ -582,16 +620,9 @@ def _reduce(
     num_o = max(1, math.prod(out_shape))
     count = x.numel() // num_o
     red_pairs, kept_pairs = _ti_pairs(x, _probe(x, red_axes))
-    complex_input = getattr(trait, "complex_input", False)
-
     from . import kernel_rowtile as rt
 
-    if (
-        not complex_input
-        and rt.inner_tree_order_enabled()
-        and count < _INT32_LIMIT
-        and num_o < _INT32_LIMIT
-    ):
+    if rt.inner_tree_order_enabled() and count < _INT32_LIMIT and num_o < _INT32_LIMIT:
         kind = fast_kind(red_pairs, kept_pairs, nouts)
         if x.is_contiguous() and kind in ("row", "all"):
             x2 = x.reshape(num_o, count)
@@ -604,17 +635,32 @@ def _reduce(
                 order="inner_tree",
             )
         else:
-            ordered = _try_indexed_itree(
-                trait,
-                trait_key,
-                x,
-                red_pairs,
-                kept_pairs,
-                num_o,
-                count,
-                out_dtypes,
-                nouts,
+            ordered = None
+            from . import kernel_coltile as ct
+
+            col_view = _physical_col_view(
+                x, red_axes, red_pairs, kept_pairs, count, num_o
             )
+            if col_view is not None:
+                ordered = ct.reduce_ordered_col(
+                    trait,
+                    trait_key,
+                    col_view,
+                    out_dtypes,
+                    nouts,
+                )
+            if ordered is None:
+                ordered = _try_indexed_itree(
+                    trait,
+                    trait_key,
+                    x,
+                    red_pairs,
+                    kept_pairs,
+                    num_o,
+                    count,
+                    out_dtypes,
+                    nouts,
+                )
         if ordered is not None:
             return tuple(_as_shape(o, out_shape) for o in ordered)
 
@@ -626,30 +672,34 @@ def _reduce(
         outs = reduce_all2(trait, trait_key, x, out_dtypes, block=block)
         return tuple(_as_shape(o, out_shape) for o in outs)
 
-    # Reshape post-TI contiguous innermost reductions onto a fast kernel; general remains
-    # the fallback for direct calls and declines.
-    if (
-        not complex_input
-        and len(out_shape) > 0
-        and x.is_contiguous()
-        and count < _INT32_LIMIT
-        and num_o < _INT32_LIMIT
-    ):
+    # Reshape dense TensorIterator row/column views onto fast kernels; general remains
+    # the fallback for other layouts and declines.
+    if len(out_shape) > 0 and count < _INT32_LIMIT and num_o < _INT32_LIMIT:
         kind = fast_kind(red_pairs, kept_pairs, nouts)
         red_n = x.numel() // max(1, math.prod(out_shape))
-        if kind == "row":
+        if kind == "row" and x.is_contiguous():
             x2 = x.reshape(math.prod(out_shape), red_n)
             fast = _try_fast_row(trait, trait_key, x2, out_dtypes, nouts)
             if fast is not None:
                 return tuple(_as_shape(o, out_shape) for o in fast)
-        elif kind == "col":
-            # Splitting the reduced axis supplies parallelism for tall-narrow inputs:
-            # 7.24x, 2.53x, and 1.49x of ATen at (65536, 256), (16384, 1024), and (4096, 4096).
+        col_view = _physical_col_view(x, red_axes, red_pairs, kept_pairs, red_n, num_o)
+        if col_view is not None:
             from . import kernel_coltile as ct
 
-            x2 = x.reshape(red_n, math.prod(out_shape))
-            out = ct.reduce_col_tile(trait, trait_key, x2, out_dtypes[0])
-            return (_as_shape(out, out_shape),)
+            if col_view.dim() == 2:
+                if nouts == 1:
+                    fast = (
+                        ct.reduce_col_tile(trait, trait_key, col_view, out_dtypes[0]),
+                    )
+                else:
+                    fast = ct.reduce_col_tile_2out(
+                        trait, trait_key, col_view, out_dtypes
+                    )
+            else:
+                fast = ct.reduce_batched_col_tile(
+                    trait, trait_key, col_view, out_dtypes, nouts
+                )
+            return tuple(_as_shape(out, out_shape) for out in fast)
 
     # One block per kept coordinate is the whole grid, so split the reduced run whenever it
     # would not fill the SMs and there is enough work per output to pay for a second launch.
@@ -752,7 +802,6 @@ def _reduce_all(
     if not x.is_contiguous():
         return _reduce(trait, trait_key, x, None, out_dtypes, nouts, block=block)
     L = x.numel()
-    complex_input = getattr(trait, "complex_input", False)
     xf = x.reshape(-1)
     if L == 1 and xf.stride(0) != 1:
         # A single element is contiguous at any stride; the wrap still requires unit stride.
@@ -762,7 +811,7 @@ def _reduce_all(
     x2 = xf.view(1, -1)
     from . import kernel_rowtile as rt
 
-    if not complex_input and rt.inner_tree_order_enabled() and L < _INT32_LIMIT:
+    if rt.inner_tree_order_enabled() and L < _INT32_LIMIT:
         outs = rt.reduce_row_tile(
             trait,
             trait_key,
@@ -772,7 +821,7 @@ def _reduce_all(
             order="inner_tree",
         )
         return tuple(_as_shape(o, ()) for o in outs)
-    if not complex_input and _oneshot_ok(x2):
+    if _oneshot_ok(x2):
         # Avoid row-packing threads for a single-row launch; None keeps the existing config.
         cfg = rt.single_row_config(L, x.element_size() * 8)
         outs = rt.reduce_row_tile(
@@ -787,16 +836,13 @@ def _reduce_all(
         return tuple(_as_shape(o, ()) for o in outs)
     from . import kernel_xcta as xc
 
-    if not complex_input:
-        if nouts == 1:
-            res = xc.reduce_row_xcta(trait, trait_key, xf, out_dtypes[0], flatten=True)
-            res = None if res is None else (res,)
-        else:
-            res = xc.reduce_row_xcta_2out(
-                trait, trait_key, xf, out_dtypes, flatten=True
-            )
-        if res is not None:
-            return res
+    if nouts == 1:
+        res = xc.reduce_row_xcta(trait, trait_key, xf, out_dtypes[0], flatten=True)
+        res = None if res is None else (res,)
+    else:
+        res = xc.reduce_row_xcta_2out(trait, trait_key, xf, out_dtypes, flatten=True)
+    if res is not None:
+        return res
     # If xcta declines, grid-stride any L without reshaping or extent-dependent compile cost.
     sm = _hw.caps(x.device).sm_count
     G = _grid_size(L, block, sm, grid_mult)
@@ -809,16 +855,18 @@ def _reduce_all(
     outs = [torch.empty(1, device=x.device, dtype=d) for d in out_dtypes]
 
     # Stage 1 models G contiguous chunks as kept (G, chunk), reduced (chunk, 1);
-    # flat_tail guards the last and gidx_from="flat" preserves global indices.
+    # flat_tail guards the last and chunk indices stay relative to the input view.
+    in_base = int(xf.storage_offset())
     s1 = ReduceBlock(
         trait,
         count=chunk,
         num_o=G,
         red_pairs=[(chunk, 1)],
         kept_pairs=[(G, chunk)],
-        limit=L,
+        in_base=in_base,
+        limit=in_base + L,
         flat_tail=True,
-        gidx_from="flat",
+        gidx_from="chunk",
         nouts=trait.nfields,
         final=False,
         block=block,

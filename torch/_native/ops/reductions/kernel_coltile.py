@@ -2,17 +2,22 @@
 # Threads own vectorized kept-axis outputs without lane merging. Splitting the reduced
 # axis provides parallelism; unsplit (65536, 256) took 7830us versus ATen's 15.8us.
 
+import math
+from collections.abc import Sequence
 from typing import Any
 
-from cutlass import Int32
+import cutlass
+import cutlass.cute as cute
+from cutlass import const_expr, Int32, Int64
 
 import torch
 
 from ...cutedsl import launch as _L
 from ...cutedsl.dtypes import cute2torch, torch2cute
 from ...cutedsl.plan_cache import cached_plan
-from . import tile
-from .kernel_general import _launch, ReduceBlock
+from . import _storage, tile
+from .kernel_general import _flat, _launch, ReduceBlock
+from .traits import WARP
 
 
 _compile = _L.compile_kernel
@@ -33,11 +38,295 @@ _VEC_MAX = 4
 # while argmax gains 6-8% and wide-short sum gains 15%.
 _THREADS_PER_BLOCK = 32
 _WIDE_ACC_THREADS_PER_BLOCK = 64  # 3-field traits (Welford): see above
+_ORDERED_WORKER_WARPS = 16
+
+
+class _OrderedColReduce:
+    """Preserve the row inner-tree DAG while coalescing adjacent column loads."""
+
+    def __init__(
+        self,
+        trait: Any,
+        plan: Any,
+        R: int,
+        C: int,
+        B: int,
+        nouts: int,
+    ) -> None:
+        if plan.shape not in ("multirow", "looped"):
+            raise ValueError(f"ordered columns do not support {plan.shape=}")
+        self.trait = trait
+        self.plan = plan
+        self.R = R
+        self.C = C
+        self.B = B
+        self.nouts = nouts
+        self.complex_input = getattr(trait, "complex_input", False)
+        self.output_widths = tuple(getattr(trait, "output_widths", (1,) * nouts))
+        self.workers = (
+            1 if plan.shape == "multirow" else min(_ORDERED_WORKER_WARPS, plan.wpr)
+        )
+        self.outputs_per_block = 128 if plan.shape == "multirow" else WARP
+
+    @property
+    def cache_sig(self) -> tuple[Any, ...]:
+        return (
+            self.plan.shape,
+            self.R,
+            self.C,
+            self.B,
+            self.plan.vec,
+            self.plan.wpr,
+            self.plan.depth,
+            self.plan.batches,
+            self.nouts,
+            self.output_widths,
+        )
+
+    @cute.jit
+    def __call__(self, mIn: cute.Tensor, mOuts: list, in_base: Int64, stream):
+        self.kernel(mIn, mOuts, in_base).launch(
+            grid=[math.ceil(self.B * self.C / self.outputs_per_block), 1, 1],
+            block=(
+                [self.outputs_per_block, 1, 1]
+                if const_expr(self.plan.shape == "multirow")
+                else [WARP, self.workers, 1]
+            ),
+            stream=stream,
+        )
+
+    @cute.jit
+    def _leaf(self, mIn, in_base, batch, col, red, active):
+        trait = self.trait
+        valid = active & (red < Int32(self.R))
+        safe_red = red if valid else Int32(0)
+        index = (
+            in_base
+            + Int64(batch) * Int64(self.R * self.C)
+            + Int64(safe_red) * Int64(self.C)
+            + Int64(col)
+        )
+        got = trait.leaf(
+            tile._load_reduction_value(
+                trait, mIn, index, const_expr(self.complex_input)
+            ),
+            safe_red,
+        )
+        ident = trait.init()
+        return tuple(got[f] if valid else ident[f] for f in range(trait.nfields))
+
+    @cute.jit
+    def _lane_root(self, mIn, in_base, batch, col, base, active):
+        vals = [
+            self._leaf(
+                mIn,
+                in_base,
+                batch,
+                col,
+                base + Int32(i),
+                active,
+            )
+            for i in range(self.plan.vec)
+        ]
+        return tile._reduce_vec(vals, self.plan.vec, self.trait.combine)
+
+    @cute.kernel
+    def kernel(self, mIn: cute.Tensor, mOuts: list, in_base: Int64):
+        tx, ty, _ = cute.arch.thread_idx()
+        bx, _, _ = cute.arch.block_idx()
+        trait, plan = self.trait, self.plan
+        op, ident = trait.combine, trait.init()
+
+        if const_expr(plan.shape == "multirow"):
+            output = Int32(bx) * Int32(self.outputs_per_block) + Int32(tx)
+            active = output < Int32(self.B * self.C)
+            safe = output if active else Int32(0)
+            batch, col = safe // Int32(self.C), safe % Int32(self.C)
+            tree = []
+            for load in cutlass.range_constexpr(plan.batches[0][2]):
+                tile._streaming_push(
+                    tree,
+                    self._lane_root(
+                        mIn,
+                        in_base,
+                        batch,
+                        col,
+                        Int32(load * plan.vec),
+                        active,
+                    ),
+                    load,
+                    plan.depth,
+                    op,
+                )
+            final = tree[0]
+        else:
+            lane, worker = Int32(tx), Int32(ty)
+            output = Int32(bx) * Int32(WARP) + lane
+            active = output < Int32(self.B * self.C)
+            safe = output if active else Int32(0)
+            batch, col = safe // Int32(self.C), safe % Int32(self.C)
+            nf = const_expr(trait.nfields)
+            smem = cutlass.utils.SmemAllocator()
+            roots = [
+                smem.allocate_tensor(
+                    trait.fdtypes[f],
+                    cute.make_layout(const_expr(plan.wpr * WARP)),
+                    byte_alignment=8,
+                )
+                for f in range(nf)
+            ]
+            final = ident
+            for b in cutlass.range_constexpr(len(plan.batches)):
+                batch_off, _remaining, loads, warp_chunk = plan.batches[b]
+                for warp in cutlass.range(worker, plan.wpr, self.workers):
+                    load_tree = []
+                    for load in cutlass.range_constexpr(loads):
+                        if const_expr(nf == 1):
+                            lane_roots = cute.make_rmem_tensor(
+                                cute.make_layout(WARP), trait.fdtypes[0]
+                            )
+                            for original_lane in cutlass.range_constexpr(WARP):
+                                lane_roots[original_lane] = self._lane_root(
+                                    mIn,
+                                    in_base,
+                                    batch,
+                                    col,
+                                    Int32(batch_off + load * WARP * plan.vec)
+                                    + warp * Int32(warp_chunk)
+                                    + Int32(original_lane * plan.vec),
+                                    active,
+                                )[0]
+                            load_root = tile._inner_tree_reduce(
+                                [(lane_roots[i],) for i in range(WARP)], op
+                            )
+                        else:
+                            lane_tree = []
+                            for original_lane in cutlass.range_constexpr(WARP):
+                                tile._streaming_push(
+                                    lane_tree,
+                                    self._lane_root(
+                                        mIn,
+                                        in_base,
+                                        batch,
+                                        col,
+                                        Int32(batch_off + load * WARP * plan.vec)
+                                        + warp * Int32(warp_chunk)
+                                        + Int32(original_lane * plan.vec),
+                                        active,
+                                    ),
+                                    original_lane,
+                                    5,
+                                    op,
+                                )
+                            load_root = lane_tree[0]
+                        tile._streaming_push(load_tree, load_root, load, plan.depth, op)
+                    slot = warp * Int32(WARP) + lane
+                    for f in cutlass.range_constexpr(nf):
+                        roots[f][slot] = load_tree[0][f]
+                cute.arch.barrier()
+                groups = const_expr(plan.wpr // plan.kchunk)
+                if worker == Int32(0):
+                    group_vals = [
+                        tile._inner_tree_reduce(
+                            [
+                                tuple(
+                                    roots[f][(g * plan.kchunk + i) * Int32(WARP) + lane]
+                                    for f in range(nf)
+                                )
+                                for i in range(plan.kchunk)
+                            ],
+                            op,
+                        )
+                        for g in range(groups)
+                    ]
+                    padding = ident
+                    if const_expr(nf > 1):
+                        dynamic_false = lane < Int32(0)
+                        padding = tuple(
+                            group_vals[0][f] if dynamic_false else ident[f]
+                            for f in range(nf)
+                        )
+                    group_vals.extend([padding] * (WARP - groups))
+                    final = op(final, tile._inner_tree_reduce(group_vals, op))
+                cute.arch.barrier()
+
+        projected = trait.project(final, trait.acc(self.R))
+        if (Int32(ty) == Int32(0)) & active:
+            if const_expr(self.nouts == 1):
+                tile._store_reduction_value(
+                    mOuts[0],
+                    output,
+                    projected,
+                    const_expr(self.output_widths[0]),
+                )
+            else:
+                for k in cutlass.range_constexpr(self.nouts):
+                    tile._store_reduction_value(
+                        mOuts[k],
+                        output,
+                        projected[k],
+                        const_expr(self.output_widths[k]),
+                    )
 
 
 def _split_p(R: int) -> int:
     """Split the reduced axis into about _Q_TARGET rows per chunk."""
     return max(1, min(_P_MAX, -(-R // _Q_TARGET)))
+
+
+def reduce_ordered_col(
+    trait: Any,
+    trait_key: str,
+    x: torch.Tensor,
+    out_dtypes: Sequence[torch.dtype],
+    nouts: int,
+) -> tuple[torch.Tensor, ...] | None:
+    """Reduce the middle axis of a contiguous (B, R, C) physical view."""
+    if x.dim() == 2:
+        B, (R, C) = 1, x.shape
+        out_shape = (C,)
+    elif x.dim() == 3 and x.is_contiguous():
+        B, R, C = x.shape
+        out_shape = (B, C)
+    else:
+        return None
+    if x.stride(-1) != 1 or C < WARP:
+        return None
+    from . import kernel_rowtile as rt
+
+    plan = rt.trait_itree_plan(
+        trait, R, B * C, x.element_size(), stage=False, device=x.device
+    )
+    if plan is None or plan.shape not in ("multirow", "looped"):
+        return None
+    op = _OrderedColReduce(trait, plan, R, C, B, nouts)
+    outs = [
+        torch.empty(out_shape, device=x.device, dtype=dtype)
+        for dtype in out_dtypes[:nouts]
+    ]
+    kernel_x = _flat(x)
+    kernel_outs = [_storage.flat_view(out) for out in outs]
+    fake_in = _L.fake_compact(torch2cute[kernel_x.dtype], (_L.sym_int64(),))
+    fake_outs = [
+        _L.fake_compact(torch2cute[out.dtype], (_L.sym(),)) for out in kernel_outs
+    ]
+    key = (
+        "ordered_col",
+        trait_key,
+        x.dtype,
+        tuple(out_dtypes[:nouts]),
+        str(x.device),
+    ) + op.cache_sig
+    build = lambda: _compile(  # noqa: E731
+        op, fake_in, fake_outs, Int64(x.storage_offset()), _stream()
+    )
+    cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")(
+        _L.read_only(kernel_x),
+        kernel_outs,
+        Int64(x.storage_offset()),
+        _stream(),
+    )
+    return tuple(outs)
 
 
 def reduce_col_tile(
@@ -50,13 +339,77 @@ def reduce_col_tile(
     vec: int | None = None,
 ) -> torch.Tensor:
     """Reduce dim 0 of contiguous 2D x to (C,), splitting it npar ways."""
-    if x.dim() != 2 or not x.is_cuda or x.stride(-1) != 1:
-        raise AssertionError(f"want 2D contiguous-last-dim CUDA, got {tuple(x.shape)}")
+    return _reduce_col_tile(
+        trait,
+        trait_key,
+        x,
+        [out_dtype],
+        1,
+        threads_per_block,
+        npar,
+        vec,
+    )[0]
+
+
+def reduce_col_tile_2out(
+    trait: Any,
+    trait_key: str,
+    x: torch.Tensor,
+    out_dtypes: Sequence[torch.dtype],
+    threads_per_block: int | None = None,
+    npar: int | None = None,
+    vec: int | None = None,
+) -> tuple[torch.Tensor, ...]:
+    return _reduce_col_tile(
+        trait,
+        trait_key,
+        x,
+        out_dtypes,
+        2,
+        threads_per_block,
+        npar,
+        vec,
+    )
+
+
+def reduce_batched_col_tile(
+    trait: Any,
+    trait_key: str,
+    x: torch.Tensor,
+    out_dtypes: Sequence[torch.dtype],
+    nouts: int,
+) -> tuple[torch.Tensor, ...]:
+    return _reduce_col_tile(trait, trait_key, x, out_dtypes, nouts, None, None, None)
+
+
+def _reduce_col_tile(
+    trait: Any,
+    trait_key: str,
+    x: torch.Tensor,
+    out_dtypes: Sequence[torch.dtype],
+    nouts: int,
+    threads_per_block: int | None,
+    npar: int | None,
+    vec: int | None,
+) -> tuple[torch.Tensor, ...]:
+    if x.dim() not in (2, 3) or not x.is_cuda or x.stride(-1) != 1:
+        raise AssertionError(
+            f"want 2D/3D contiguous-last-dim CUDA, got {tuple(x.shape)}"
+        )
+    if x.dim() == 2:
+        B, (R, C) = 1, x.shape
+        rows = x
+        out_shape = (C,)
+    else:
+        if not x.is_contiguous():
+            raise AssertionError(f"want contiguous batched input, got {x.stride()}")
+        B, R, C = x.shape
+        rows = x.reshape(B * R, C)
+        out_shape = (B, C)
     if threads_per_block is None:
         threads_per_block = (
             _WIDE_ACC_THREADS_PER_BLOCK if trait.nfields >= 3 else _THREADS_PER_BLOCK
         )
-    R, C = x.shape
     vec = min(tile.vec_size(C, x.element_size()), _VEC_MAX) if vec is None else vec
     if vec <= 0:
         raise ValueError(f"vec must be positive, got {vec}")
@@ -67,46 +420,61 @@ def reduce_col_tile(
         npar = _split_p(R)
     elif npar <= 0:
         raise ValueError(f"npar must be positive, got {npar}")
-    out = torch.empty(C, device=x.device, dtype=out_dtype)
-    align = _L.supported_alignment(x, tile.align_bytes(C, x.element_size()))
-    nchunks, q, nrows = Int32(C // vec), Int32(-(-R // npar)), Int32(R)
+    outs = [
+        torch.empty(out_shape, device=x.device, dtype=dtype)
+        for dtype in out_dtypes[:nouts]
+    ]
+    kernel_x = _storage.row_view(rows)
+    kernel_outs = [_storage.flat_view(out) for out in outs]
+    align = _L.supported_alignment(rows, tile.align_bytes(C, x.element_size()))
+    total = B * C
+    nchunks = Int32(total // vec)
+    batch_chunks = Int32(C // vec) if x.dim() == 3 else None
+    q, nrows = Int32(-(-R // npar)), Int32(R)
 
     single = npar == 1
-    pc = C >= _C_THREAD_STAGE2  # (P, C) for a thread-per-column stage 2, else (C, P)
+    pc = total >= _C_THREAD_STAGE2
     op = tile.TileReduce(
         trait,
-        torch2cute[x.dtype],
+        torch2cute[kernel_x.dtype],
         "col",
         C,
         threads_per_block=threads_per_block,
+        nouts=nouts,
         final=single,
         vec=vec,
+        batched_col=x.dim() == 3,
         pc=pc,
     )
     parts = (
         []
         if single
         else [
-            torch.empty(C * npar, device=x.device, dtype=cute2torch[trait.fdtypes[f]])
+            torch.empty(
+                total * npar,
+                device=x.device,
+                dtype=cute2torch[trait.fdtypes[f]],
+            )
             for f in range(trait.nfields)
         ]
     )
-    dsts = [out] if single else parts
+    dsts = outs if single else parts
+    kernel_dsts = [_storage.flat_view(dst) for dst in dsts]
 
     def _fake():
         # Dynamic descriptors require vec divisibility; None avoids a 1.27x unused argument.
         return (
             [
                 _L.fake_compact(
-                    torch2cute[x.dtype],
-                    (_L.sym(), _L.sym(vec)),
+                    torch2cute[kernel_x.dtype],
+                    (_L.sym(), _L.sym(vec * (2 if x.is_complex() else 1))),
                     stride_order=(1, 0),
                     align=align,
                 )
             ],
-            [_L.fake_compact(torch2cute[d.dtype], (_L.sym(),)) for d in dsts],
+            [_L.fake_compact(torch2cute[d.dtype], (_L.sym(),)) for d in kernel_dsts],
             nchunks,
-            None,  # nwaves: the row axis's
+            batch_chunks,
             nrows,
             q,
             Int32(npar),
@@ -124,16 +492,16 @@ def reduce_col_tile(
         "coltile",
         trait_key,
         x.dtype,
-        out_dtype,
+        tuple(out_dtypes[:nouts]),
         align,
         str(x.device),
     ) + op.cache_sig
     build = lambda: _compile(op, *_fake())  # noqa: E731
     cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")(
-        [_L.read_only(x)],
-        list(dsts),
+        [_L.read_only(kernel_x)],
+        kernel_dsts,
         nchunks,
-        None,
+        batch_chunks,
         nrows,
         q,
         Int32(npar),
@@ -146,34 +514,40 @@ def reduce_col_tile(
         _stream(),
     )
     if single:
-        return out
+        return tuple(outs)
 
     # Fold npar partials and project with true R; use threads per column only when C fills the GPU.
     if not pc:
         s2 = ReduceBlock(
             trait,
             count=npar,
-            num_o=C,
+            num_o=total,
             red_pairs=[(npar, 1)],
-            kept_pairs=[(C, npar)],
+            kept_pairs=[(total, npar)],
             from_partials=True,
             project_n=R,
-            nouts=1,
+            nouts=nouts,
             final=True,
             block=128,
         )
         pdt = tuple(pp.dtype for pp in parts)
-        key2 = ("coltile2b", trait_key, out_dtype, pdt) + s2.cache_sig
-        _launch(s2, key2, parts, [out])
-        return out
+        key2 = (
+            "coltile2b",
+            trait_key,
+            tuple(out_dtypes[:nouts]),
+            pdt,
+        ) + s2.cache_sig
+        _launch(s2, key2, parts, kernel_outs)
+        return tuple(outs)
 
     # Shared combine mode uses nchunks as C and nrows as true R; q is unused.
     op2 = tile.TileReduce(
         trait,
-        torch2cute[x.dtype],
+        torch2cute[kernel_x.dtype],
         "col",
-        C,
+        total,
         threads_per_block=threads_per_block,
+        nouts=nouts,
         vec=1,
         combine=True,
     )
@@ -182,8 +556,11 @@ def reduce_col_tile(
         # Row nwaves and split q are unused.
         return (
             [_L.fake_compact(torch2cute[pp.dtype], (_L.sym(),)) for pp in parts],
-            [_L.fake_compact(torch2cute[out.dtype], (_L.sym(),))],
-            Int32(C),
+            [
+                _L.fake_compact(torch2cute[out.dtype], (_L.sym(),))
+                for out in kernel_outs
+            ],
+            Int32(total),
             None,  # nwaves
             Int32(R),
             None,  # q
@@ -202,15 +579,15 @@ def reduce_col_tile(
         "coltile2",
         trait_key,
         x.dtype,
-        out_dtype,
+        tuple(out_dtypes[:nouts]),
         pdt,
         str(x.device),
     ) + op2.cache_sig
     build2 = lambda: _compile(op2, *_fake2())  # noqa: E731
     cached_plan(_CACHE, key2, build2, op=f"aten::{trait_key}")(
         [_L.read_only(pp) for pp in parts],
-        [out],
-        Int32(C),
+        kernel_outs,
+        Int32(total),
         None,
         Int32(R),
         None,
@@ -223,4 +600,4 @@ def reduce_col_tile(
         None,
         _stream(),
     )
-    return out
+    return tuple(outs)
