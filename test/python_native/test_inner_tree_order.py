@@ -385,12 +385,17 @@ class TestInnerTreeOrder(TestCase):
             len(plans), len(configs), "architecture knobs did not change any plan"
         )
         self.assertIn(rt._itree_arch(torch.device("cuda")), entries.values())
-        self.assertEqual(set(entries), {"default", (9, 0), (10, 0)})
+        self.assertEqual(set(entries), {"default", (9, 0), (10, 0), (10, 7)})
 
     def test_async_combine_short_blocks_match_upstream(self):
         n = 1 << 20
         for m in (1, 33):
-            with self.subTest(rows=m):
+            with (
+                self.subTest(rows=m),
+                mock.patch.object(
+                    rt, "_itree_arch", return_value=rt._ITREE_ARCH[(10, 0)]
+                ),
+            ):
                 torch.manual_seed(0)
                 x = torch.randn(m, n, device="cuda")
                 plan = rt.itree_plan(n, m, 4, device=x.device)

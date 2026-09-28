@@ -129,6 +129,9 @@ class _ItreeArch(NamedTuple):
     # Most cp.async per lane and row; 0 disables combine staging.
     combine_async: int
     combine_max: int  # maximum partials staged per row
+    combine_unroll: int = (
+        0  # staged fold unroll factor; 0 retains full static unrolling
+    )
 
 
 # Performance tuning is keyed by full compute capability. Each measured GPU has
@@ -160,6 +163,15 @@ _ITREE_ARCH: dict[str | tuple[int, int], _ItreeArch] = {
         combine_async=32,
         combine_max=2048,
     ),
+    # Pin Rubin's measured baseline independently of future default changes.
+    (10, 7): _ItreeArch(
+        split_stage_rows=0,
+        combine_rpb=128,
+        combine_group_bytes=0,
+        stage_rows=False,
+        combine_async=0,
+        combine_max=512,
+    ),
 }
 
 
@@ -168,6 +180,67 @@ def _itree_arch(
 ) -> _ItreeArch:
     """Return tuning for `device`, defaulting safely because all knobs are bit-neutral."""
     return _ITREE_ARCH.get(_hw.caps(device).cc, _ITREE_ARCH["default"])
+
+
+def select_full_itree_arch(
+    cc: tuple[int, int],
+    dtype: torch.dtype,
+    trait_key: str,
+    N: int,
+    M: int,
+    *,
+    field_bits: tuple[int, ...],
+    out_dtypes: tuple[torch.dtype, ...],
+    alignment: int,
+    contiguous: bool,
+) -> _ItreeArch | None:
+    if (
+        cc != (10, 7)
+        or dtype not in (torch.float32, torch.bfloat16)
+        or M != 1
+        or not contiguous
+        or alignment < tile.TRANSFER_ALIGNMENT
+    ):
+        return None
+    itemsize = 4 if dtype == torch.float32 else 2
+    if N * itemsize not in (256 << 20, 2 << 30):
+        return None
+    if trait_key == "sum" and field_bits == (32,) and out_dtypes == (torch.float32,):
+        unroll = 0
+    elif (
+        trait_key == "argmaxi32"
+        and field_bits == (32, 32)
+        and out_dtypes == (torch.int64,)
+    ):
+        unroll = 128
+    elif field_bits == (32, 32, 32) and (
+        (trait_key == "var0" and out_dtypes == (dtype,))
+        or (trait_key == "varmean0" and out_dtypes == (dtype, dtype))
+    ):
+        unroll = 64
+    else:
+        return None
+    # Measured full-reduction anchors; keep columns and other sizes on their arch profile.
+    return _ItreeArch(4, WARP, 16, False, 32, 2048, unroll)
+
+
+def _full_itree_arch(
+    trait: Any, trait_key: str, x: torch.Tensor, out_dtypes: Sequence[torch.dtype]
+) -> _ItreeArch | None:
+    M, N = x.shape
+    if M != 1 or N * x.element_size() not in (256 << 20, 2 << 30):
+        return None
+    return select_full_itree_arch(
+        _hw.caps(x.device).cc,
+        x.dtype,
+        trait_key,
+        N,
+        M,
+        field_bits=tuple(dt.width for dt in trait.fdtypes),
+        out_dtypes=tuple(out_dtypes),
+        alignment=_L.supported_alignment(x, tile.TRANSFER_ALIGNMENT),
+        contiguous=x.is_contiguous(),
+    )
 
 
 # Default per-thread width for the order, in elements (k*vec*eff live in registers at once).
@@ -193,6 +266,52 @@ def inner_tree_order_enabled() -> bool:
         os.environ.get(name, "") not in ("", "0")
         for name in (_INNER_TREE_ENV, _SUM_INNER_TREE_ENV)
     )
+
+
+def reduction_order(
+    order: Literal["unordered", "inner_tree"] | None = None,
+) -> Literal["unordered", "inner_tree"]:
+    if order is None:
+        return "inner_tree" if inner_tree_order_enabled() else "unordered"
+    if order not in ("unordered", "inner_tree"):
+        raise ValueError(f"unknown reduction order: {order!r}")
+    return order
+
+
+def select_row_order(
+    cc: tuple[int, int],
+    dtype: torch.dtype,
+    trait_key: str,
+    N: int,
+    M: int,
+    *,
+    order: Literal["unordered", "inner_tree"],
+    nfields: int,
+    nouts: int,
+    acc_bits: int = 32,
+    alignment: int = 16,
+) -> Literal["linear", "inner_tree"]:
+    if order == "inner_tree":
+        return "inner_tree"
+    if order != "unordered":
+        raise ValueError(f"unknown reduction order: {order!r}")
+    if (
+        cc != (10, 7)
+        or dtype not in (torch.float32, torch.bfloat16)
+        or N != 1024
+        or acc_bits != 32
+        or alignment < 16
+    ):
+        return "linear"
+    itemsize = 4 if dtype == torch.float32 else 2
+    # Seed measured anchors; intermediate sizes retain their existing policy.
+    if M * N * itemsize not in (16 << 20, 64 << 20, 256 << 20, 2 << 30):
+        return "linear"
+    if nfields == 3 and (trait_key, nouts) in (("var0", 1), ("varmean0", 2)):
+        return "inner_tree"
+    if dtype == torch.bfloat16 and (trait_key, nfields, nouts) == ("argmaxi32", 2, 1):
+        return "inner_tree"
+    return "linear"
 
 
 class _ItreePlan(NamedTuple):
@@ -225,6 +344,7 @@ class _ItreePlan(NamedTuple):
     # COMBINE shape only: partials per row per cp.async-staged smem tile. 0 folds straight from
     # global. Also bit-neutral -- staging moves where the operand is read from, not the chain.
     combine_tile: int = 0
+    combine_unroll: int = 0
 
     @property
     def sig(self) -> tuple[Any, ...]:
@@ -243,6 +363,7 @@ class _ItreePlan(NamedTuple):
             self.stage_rows,
             self.combine_grp,
             self.combine_tile,
+            self.combine_unroll,
         )
 
 
@@ -271,6 +392,8 @@ def itree_plan(
     stage: bool | None = None,
     device: torch.device | int | str | None = None,
     thread_elems: int | None = None,
+    *,
+    arch: _ItreeArch | None = None,
 ) -> _ItreePlan | None:
     """Return the upstream-matching plan, or None to use default order without declining."""
     from .inner_tree_plan import (
@@ -303,7 +426,7 @@ def itree_plan(
             stage_rows=(
                 stage is not False
                 and N * itemsize >= _TMA_MIN_STRIDE
-                and _itree_arch(device).stage_rows
+                and (arch if arch is not None else _itree_arch(device)).stage_rows
             ),
         )
     prm = compute_inner_tree_params(N, M, vec)
@@ -329,7 +452,9 @@ def itree_plan(
             prm.effective_loads,
             _ITREE_THREAD_ELEMS if thread_elems is None else thread_elems,
         )
-        split_stage_rows = _itree_arch(device).split_stage_rows
+        split_stage_rows = (
+            arch if arch is not None else _itree_arch(device)
+        ).split_stage_rows
         stage_rpb = (
             math.gcd(prm.num_batches, split_stage_rows)
             if (
@@ -431,9 +556,11 @@ def trait_itree_plan(
     itemsize: int,
     stage: bool | None = None,
     device: torch.device | int | str | None = None,
+    *,
+    arch: _ItreeArch | None = None,
 ) -> _ItreePlan | None:
     """Retune ragged looped plans whose arithmetic or storage favors less fusion."""
-    plan = itree_plan(N, M, itemsize, stage=stage, device=device)
+    plan = itree_plan(N, M, itemsize, stage=stage, device=device, arch=arch)
     if plan is None or plan.shape != "looped" or all(tm.exact for tm in plan.tms):
         return plan
     from . import traits as T
@@ -457,6 +584,7 @@ def trait_itree_plan(
         thread_elems=thread_elems,
         stage=stage,
         device=device,
+        arch=arch,
     )
 
 
@@ -466,9 +594,13 @@ def itree_combine_plan(
     device: torch.device | int | str | None = None,
     nfields: int = 1,
     nrows: int | None = None,
+    *,
+    arch: _ItreeArch | None = None,
 ) -> _ItreePlan:
     """Plan the architecture-tuned, bit-neutral fold of each row's split partials."""
-    arch = _itree_arch(device)
+    arch = _itree_arch(device) if arch is None else arch
+    if arch.combine_unroll < 0:
+        raise ValueError("combine_unroll must be nonnegative")
     caps = _hw.caps(device)
     nbatch = itree.split[0]
     rpb = arch.combine_rpb
@@ -506,6 +638,7 @@ def itree_combine_plan(
         itree.split,
         combine_grp=g,
         combine_tile=tile_n,
+        combine_unroll=min(arch.combine_unroll, tile_n),
     )
 
 
@@ -664,6 +797,8 @@ def _run_itree(
     itree: _ItreePlan,
     nouts: int = 1,
     out: Sequence[torch.Tensor] | None = None,
+    *,
+    arch: _ItreeArch | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Launch each stage; split buffers are per field and supplied outputs are 1-D unit-stride."""
     M, N = x.shape
@@ -684,6 +819,7 @@ def _run_itree(
                 kchunk=itree.kchunk,
                 stage=False,
                 device=x.device,
+                arch=arch,
             ),
         )._replace(stage_rows=False)
     kernel_x = _storage.row_view(x)
@@ -705,6 +841,7 @@ def _run_itree(
                 kchunk=itree.kchunk,
                 stage=False,
                 device=x.device,
+                arch=arch,
             ),
         )
     # N is baked into the DAG, so the row extent is static and only M rides in dynamically.
@@ -770,6 +907,7 @@ def _run_itree(
             x.device,
             nfields=trait.nfields,
             nrows=M,
+            arch=arch,
         ),
         dt,
         ([fake_1d(p, palign) for p in parts], [fake_1d(o) for o in kernel_outs]),
@@ -792,10 +930,11 @@ def reduce_row_itree(
 ) -> bool:
     """Write 2-D `x` rows to 1-D `out`; return False only when no inner-tree plan exists."""
     M, N = x.shape
-    itree = trait_itree_plan(trait, N, M, x.element_size(), device=x.device)
+    arch = _full_itree_arch(trait, trait_key, x, [out.dtype])
+    itree = trait_itree_plan(trait, N, M, x.element_size(), device=x.device, arch=arch)
     if itree is None:
         return False
-    _run_itree(trait, trait_key, x, [out.dtype], itree, out=[out])
+    _run_itree(trait, trait_key, x, [out.dtype], itree, out=[out], arch=arch)
     return True
 
 
@@ -820,11 +959,14 @@ def reduce_row_tile(
     # explicit launch shapes on the default order; explicit requests raise below.
     if order not in (None, "linear", "inner_tree"):
         raise ValueError(f"order must be None, 'linear' or 'inner_tree', got {order!r}")
-    itree = None
+    itree, arch = None, None
     if (order == "inner_tree" or (order is None and inner_tree_order_enabled())) and (
         final and threads_per_row is None
     ):
-        itree = trait_itree_plan(trait, N, M, x.element_size(), device=x.device)
+        arch = _full_itree_arch(trait, trait_key, x, out_dtypes[:nouts])
+        itree = trait_itree_plan(
+            trait, N, M, x.element_size(), device=x.device, arch=arch
+        )
     if order == "inner_tree" and itree is None:
         # Explicit inner_tree cannot silently use another DAG; only the env gate may fall back.
         raise ValueError(
@@ -832,7 +974,7 @@ def reduce_row_tile(
             f"plan={trait_itree_plan(trait, N, M, x.element_size(), device=x.device) is not None}"
         )
     if itree is not None:
-        return _run_itree(trait, trait_key, x, out_dtypes, itree, nouts)
+        return _run_itree(trait, trait_key, x, out_dtypes, itree, nouts, arch=arch)
     cfg = trait_row_config(N, x.element_size() * 8, trait, nouts, x.device)
     # Scalar rows use 16 to hide narrow-load latency; vectorized rows use 4, at or near
     # the measured optimum across 4/8/16/32.

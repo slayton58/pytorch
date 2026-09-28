@@ -163,9 +163,9 @@ class TestKernelGeneral(TestCase):
         self.assertTrue(O._base_cond(x, None, "sum"))
         self.assertTrue(O._base_cond(x[:, None], 1, "sum"))
 
-    def test_family_has_exactly_one_cute_kernel(self):
-        # Assert every axis still shares one kernel. Glob files and match qualified or
-        # annotated decorators so new drivers and spellings cannot evade the check.
+    def test_family_has_only_expected_cute_kernels(self):
+        # One shared tile body plus ordered-column and partial-column combine kernels.
+        # Match qualified or annotated decorators so new spellings cannot evade the check.
         # Runtime introspection cannot distinguish @cute.kernel from @cute.jit wrappers.
         root = pathlib.Path(reductions.__file__).parent
         deco = re.compile(r"@(?:\w+\.)*cute\.kernel\b")
@@ -178,9 +178,10 @@ class TestKernelGeneral(TestCase):
             if deco.match(line.strip())
         ]
         self.assertEqual(
-            len(found), 1, f"expected one kernel in the family, got {found}"
+            [location.split(":")[0] for location in found],
+            ["kernel_coltile.py", "kernel_coltile.py", "tile.py"],
+            f"unexpected kernels in the family: {found}",
         )
-        self.assertTrue(found[0].startswith("tile.py"), f"the body moved: {found}")
 
     def test_internal_invariants_raise(self):
         # Each invariant must raise explicitly because python -O strips asserts. Exercise every
