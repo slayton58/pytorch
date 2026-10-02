@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from torch.testing._internal.common_cuda import TEST_CUDA
+from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -53,7 +53,20 @@ class TestFullInnerTreeConfig(TestCase):
             alignment=16,
             contiguous=True,
         )
-        self.assertEqual(arch, rt._ItreeArch(4, 32, 16, False, 32, 2048, unroll))
+        self.assertEqual(
+            arch,
+            rt._ItreeArch(
+                4,
+                32,
+                16,
+                False,
+                32,
+                2048,
+                unroll,
+                uniform_count=fields == 3,
+                combine_weights=fields == 3,
+            ),
+        )
         baseline = rt.itree_plan(N, 1, itemsize, arch=rt._ITREE_ARCH[(10, 7)])
         selected = rt.itree_plan(N, 1, itemsize, arch=arch)
         self.assertEqual(
@@ -75,6 +88,8 @@ class TestFullInnerTreeConfig(TestCase):
             (1, 4, 2048),
         )
         self.assertEqual(combine.combine_unroll, unroll)
+        self.assertEqual(combine.combine_count, selected.split[1] if fields == 3 else 0)
+        self.assertEqual(combine.combine_weights, fields == 3)
         self.assertEqual(combine.split, baseline.split)
 
     @parametrize(
@@ -198,6 +213,54 @@ class TestFullInnerTreeConfig(TestCase):
                 rt.reduce_row_tile(None, "sum", x, [torch.float32], order="linear")
             select.assert_not_called()
 
+    @parametrize(
+        "count,last,itemsize,fields",
+        [
+            (8192, 8192, 4, 3),
+            (8192, 8191, 4, 3),
+            (8191, 8191, 4, 3),
+            (8192, 8192, 8, 3),
+            (8192, 8192, 4, 1),
+        ],
+    )
+    @parametrize("weights", [False, True])
+    def test_uniform_count_guard_and_cache_key(
+        self, count, last, itemsize, fields, weights
+    ):
+        from torch._native.ops.reductions import kernel_rowtile as rt
+
+        split = rt._ItreePlan(
+            "split", 4, 16, 1, 2, (), (), (1024, count, last, 512, 512)
+        )
+        arch = rt._ITREE_ARCH["default"]._replace(
+            combine_group_bytes=16,
+            combine_async=8,
+            combine_max=512,
+            combine_unroll=4,
+        )
+        with mock.patch.object(
+            rt._hw, "caps", return_value=SimpleNamespace(smem_per_block_optin=232448)
+        ):
+            baseline = rt.itree_combine_plan(
+                split, itemsize, nfields=fields, nrows=1, arch=arch
+            )
+            candidate = rt.itree_combine_plan(
+                split,
+                itemsize,
+                nfields=fields,
+                nrows=1,
+                arch=arch,
+                uniform_count=True,
+                combine_weights=weights,
+            )
+        supported = (count, last, itemsize, fields) == (8192, 8192, 4, 3)
+        self.assertEqual(candidate.combine_count, count if supported else 0)
+        self.assertEqual(candidate.combine_weights, weights and supported)
+        self.assertEqual(
+            candidate._replace(combine_count=0, combine_weights=False), baseline
+        )
+        self.assertEqual(candidate.sig != baseline.sig, supported)
+
 
 @unittest.skipUnless(TEST_CUDA and TEST_CUTEDSL, "requires CUDA and CuTeDSL")
 class TestFullInnerTreeConfigDevice(TestCase):
@@ -249,6 +312,11 @@ class TestFullInnerTreeConfigDevice(TestCase):
                 self.assertEqual((producer.rows_per_block, producer.stage_e), (4, 32))
                 self.assertEqual((combine.combine_grp, combine.combine_tile), (4, 2048))
                 self.assertEqual(
+                    combine.combine_count,
+                    producer.split[1] if op in ("var", "var_mean") else 0,
+                )
+                self.assertEqual(combine.combine_weights, op in ("var", "var_mean"))
+                self.assertEqual(
                     combine.combine_unroll,
                     0 if op == "sum" else 128 if op == "argmax" else 64,
                 )
@@ -285,6 +353,65 @@ class TestFullInnerTreeConfigDevice(TestCase):
             native.set_aot_enabled(old_aot)
             if not old_enabled:
                 dsl.disable()
+
+    @unittest.skipUnless(SM90OrLater, "requires Hopper or later")
+    @parametrize("weights", [False, True])
+    def test_uniform_count_bits(self, device, weights):
+        import cutlass
+
+        from torch._native.ops.reductions import (
+            kernel_general as kg,
+            kernel_rowtile as rt,
+            traits,
+        )
+
+        rows, partials, count = 33, 1024, 8192
+        trait = traits.VarMeanOps(correction=1, acc=cutlass.Float32)
+        means = torch.randn(rows, partials, device=device).mul_(8).add_(1024)
+        means[0].fill_(-0.0)
+        means[1, 17] = float("nan")
+        means[2, 33] = float("inf")
+        parts = [
+            means.flatten(),
+            torch.rand_like(means).flatten(),
+            torch.full_like(means, count).flatten(),
+        ]
+        plan = rt._ItreePlan(
+            "combine",
+            1,
+            0,
+            1,
+            2,
+            (),
+            (),
+            (partials, count, count, 512, 512),
+            combine_grp=4,
+            combine_tile=512,
+            combine_unroll=4,
+        )
+        baseline = [torch.empty(rows, device=device) for _ in range(2)]
+        actual = [torch.empty_like(t) for t in baseline]
+
+        def launch(selected, outs):
+            block = kg.ReduceBlock(
+                trait,
+                count=partials,
+                num_o=rows,
+                red_pairs=[],
+                kept_pairs=[],
+                project_n=count * partials,
+                nouts=2,
+                order="inner_tree",
+                itree=selected,
+            )
+            key = ("test_uniform_count",) + block.cache_sig
+            kg._launch(block, key, parts, outs)
+
+        candidate = plan._replace(combine_count=count, combine_weights=weights)
+        launch(plan, baseline)
+        launch(candidate, actual)
+        for got, expected in zip(actual, baseline):
+            self.assertEqual(got.view(torch.uint8), expected.view(torch.uint8))
 
 
 instantiate_parametrized_tests(TestFullInnerTreeConfig)

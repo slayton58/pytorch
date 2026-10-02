@@ -9,6 +9,7 @@ from typing import Any
 import cutlass
 import cutlass.cute as cute
 from cutlass import const_expr, Float32, Float64, Int32, Int64
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.ffi import extern
 
 from . import minmax as _mm
@@ -107,6 +108,19 @@ class NormOps:
 
     @cute.jit
     def leaf(self, val, idx):
+        if const_expr(self.p == 2.0 and self.acc is Float32):
+            # Round each tree leaf before combining; contraction must not depend on mapping.
+            a = cute.math.absf(self.acc(val)).ir_value()
+            square = llvm.inline_asm(
+                a.type,
+                [a],
+                "mul.rn.f32 $0, $1, $1;",
+                "=f,f",
+                has_side_effects=False,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+            return (self.acc(square),)
         return (self._absp(val),)
 
     @cute.jit
@@ -189,6 +203,19 @@ class WelfordOps:
             delta = mb - ma
             mean = ma + delta * nb_over_n
             m2 = m2a + m2b + delta * delta * na * nb_over_n
+        return (mean, m2, nn)
+
+    @cute.jit
+    def combine_uniform(self, a, b, index, count: cutlass.Constexpr, weight=None):
+        # Preserve Chan's arithmetic; derive exact counts outside the accumulator chain.
+        ma, m2a, _ = a
+        mb, m2b, _ = b
+        na, nb = self.acc(index) * self.acc(count), self.acc(count)
+        nn = na + nb
+        nb_over_n = nb / nn if const_expr(weight is None) else weight
+        delta = mb - ma
+        mean = ma + delta * nb_over_n
+        m2 = m2a + m2b + delta * delta * na * nb_over_n
         return (mean, m2, nn)
 
     @cute.jit

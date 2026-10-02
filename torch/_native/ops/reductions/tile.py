@@ -634,6 +634,28 @@ def make_fragment(mX, tm, complex_input: cutlass.Constexpr = False) -> cute.Tens
     )
 
 
+@cute.jit
+def fold_row_static(
+    trait, mX, row, tm: cutlass.Constexpr, lane, accumulators: cutlass.Constexpr
+):
+    reduce_fn, combine_fn = trait.reduce, trait.combine
+    frag = make_fragment(mX, tm)
+    warp_lane, warp = lane % Int32(WARP), lane // Int32(WARP)
+    load(mX, row, tm, warp_lane, warp, frag)
+    accs = [trait.init() for _ in range(accumulators)]
+    for l in cutlass.range_constexpr(tm.loads):
+        base = tm.col_base(warp_lane, warp, l)
+        for i in cutlass.range_constexpr(tm.vec):
+            slot = const_expr((l * tm.vec + i) % accumulators)
+            accs[slot] = reduce_fn(
+                accs[slot], trait.acc(frag[i, l]), base + Int32(i), True
+            )
+    acc = accs[0]
+    for i in cutlass.range_constexpr(1, accumulators):
+        acc = combine_fn(acc, accs[i])
+    return acc
+
+
 def smem_box_layout(N: int, threads: int) -> cute.Layout:
     """Plain row-major smem for a (threads, N) TMA box.
 
@@ -737,15 +759,50 @@ class TileReduce:
         order="linear",
         # Duck-typed because its driver-owned type would invert the dependency.
         itree: Any = None,
+        row_accumulators: int = 0,
     ) -> None:
         if axis not in ("row", "col", "general"):
             raise ValueError(f"axis must be 'row', 'col' or 'general', got {axis!r}")
         if order not in ("linear", "inner_tree"):
             raise ValueError(f"order must be 'linear' or 'inner_tree', got {order!r}")
+        if row_accumulators not in (0, 1, 2, 4, 8):
+            raise ValueError("row_accumulators must be 0, 1, 2, 4, or 8")
+        if row_accumulators and (
+            axis != "row"
+            or order != "linear"
+            or use_tma
+            or combine
+            or load_ahead != 1
+            or threads_per_row < WARP
+            or getattr(trait, "complex_input", False)
+            or N <= 0
+            or N % (threads_per_row * vec_size(N, dtype.width // 8))
+            or N // threads_per_row < row_accumulators
+        ):
+            raise ValueError(
+                "static row accumulators require complete real-valued linear row tiles"
+            )
         if order == "inner_tree":
             if axis not in ("row", "general") or itree is None:
                 raise ValueError(
                     "the inner-tree order needs a row or general axis and a plan"
+                )
+            if itree.combine_weights and not itree.combine_count:
+                raise ValueError("precomputed weights require uniform combine counts")
+            if itree.combine_count and (
+                itree.shape != "combine"
+                or not itree.combine_tile
+                or not hasattr(trait, "combine_uniform")
+                or trait.acc is not cutlass.Float32
+                or len(itree.split) != 5
+                or not (0 < itree.split[0] <= 2**24)
+                or not (0 < itree.combine_count <= 2**24)
+                or itree.combine_count & (itree.combine_count - 1)
+                or itree.split[1] != itree.combine_count
+                or itree.split[2] != itree.combine_count
+            ):
+                raise ValueError(
+                    "uniform combine requires complete FP32 Welford partials"
                 )
             # The plan maps wpr chunks to wpr // kchunk warps and rows_per_block rows.
             threads_per_row = WARP * (itree.wpr // itree.kchunk) if itree.wpr else 1
@@ -809,6 +866,7 @@ class TileReduce:
         self.final = final
         self.unroll = unroll
         self.load_ahead = load_ahead
+        self.row_accumulators = row_accumulators
         self.use_tma = use_tma
         self.combine = combine
         self.batched_col = batched_col
@@ -839,7 +897,11 @@ class TileReduce:
                 N,
                 itemsize,
                 threads_per_row,
-                N // vec_size(N, itemsize) if use_tma else 1,
+                N // vec_size(N, itemsize)
+                if use_tma
+                else N // (threads_per_row * vec_size(N, itemsize))
+                if row_accumulators
+                else 1,
             )
             if axis == "row" and order == "linear"
             else None
@@ -886,7 +948,7 @@ class TileReduce:
 
     @property
     def cache_sig(self) -> tuple[Any, ...]:
-        # Only TMA keys N because its box is static; runtime paths share a vector class.
+        # Static row folds and TMA key N; runtime paths share a vector class.
         return (
             self.axis,
             self.vec,
@@ -904,7 +966,7 @@ class TileReduce:
             self.complex_input,
             self.output_widths,
             getattr(self.trait, "canonical_bool", False),
-            self.N if self.use_tma else 0,
+            self.N if self.use_tma or self.row_accumulators else 0,
             self.npairs_red,
             self.npairs_kept,
             self.wide_count,
@@ -918,7 +980,7 @@ class TileReduce:
             self.order,
             # Fixed DAGs key on N, requiring one kernel per shape instead of per vec class.
             self.itree.sig if self.itree is not None else None,
-        )
+        ) + ((self.row_accumulators,) if self.row_accumulators else ())
 
     @cute.jit
     def _fold_tma(self, mX, tma_atom, bx, tx):
@@ -1312,15 +1374,29 @@ class TileReduce:
         return self._fold_itree(sX, r_in_block, lane_w, warp_id, r_in_block, batch_idx)
 
     @cute.jit
+    def _combine_itree_partial(self, a, b, index):
+        if const_expr(self.itree.combine_count):
+            return self.trait.combine_uniform(
+                a,
+                b,
+                index,
+                const_expr(self.itree.combine_count),
+                b[2] if const_expr(self.itree.combine_weights) else None,
+            )
+        return self.trait.combine(a, b)
+
+    @cute.jit
     def _fold_itree_combine_async(self, mIns, row, lane, blk):
         """Coalesce split partials through shared memory without changing fold order."""
-        combine_fn, fdtypes = self.trait.combine, self.trait.fdtypes
+        combine_fn, fdtypes = self._combine_itree_partial, self.trait.fdtypes
         nf = const_expr(self.trait.nfields)
         nbatch = const_expr(self.itree.split[0])
         grp = const_expr(self.itree.combine_grp)
         rpb = const_expr(self.itree.rows_per_block)
         tile_n = const_expr(self.itree.combine_tile)  # partials per row per tile
         unroll = const_expr(self.itree.combine_unroll)
+        # Known counts let the third shared field hold per-index weights instead.
+        weights = const_expr(self.itree.combine_weights)
         mult = const_expr(tile_n // (WARP * grp))  # cp.async per lane per row
         ntiles = const_expr(nbatch // tile_n)
         # Pad each row's run by `grp` so a lane's run stays transfer-aligned while the runs start in
@@ -1367,19 +1443,28 @@ class TileReduce:
                     )
                     dst = Int32(const_expr(i * pitch // grp + u * WARP)) + lane
                     for f in cutlass.range_constexpr(nf):
-                        cute.copy(g2s[f], gv[f][None, src], sv[f][None, dst])
+                        if const_expr(weights and f == 2):
+                            for v in cutlass.range_constexpr(grp):
+                                j = (Int32(u * WARP) + lane) * Int32(grp) + Int32(v)
+                                count = fdtypes[f](const_expr(self.itree.combine_count))
+                                nn = fdtypes[f](j) * count + count
+                                sbuf[f][Int32(i * pitch) + j] = count / nn
+                        else:
+                            cute.copy(g2s[f], gv[f][None, src], sv[f][None, dst])
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
         # Tile 0 SEEDS the chain from partial 0 -- never from the identity, since `0.0 + -0.0` is
         # `+0.0` and this fold's first value can be a negative zero.
         acc = take(0)
+        if const_expr(weights):
+            acc = (acc[0], acc[1], fdtypes[2](self.itree.combine_count))
         if const_expr(unroll):
             for j in cutlass.range(1, tile_n, unroll=unroll):
-                acc = combine_fn(acc, take(j))
+                acc = combine_fn(acc, take(j), j)
         else:
             for j in cutlass.range_constexpr(tile_n - 1):
-                acc = combine_fn(acc, take(const_expr(j + 1)))
+                acc = combine_fn(acc, take(const_expr(j + 1)), Int32(j + 1))
         for t in cutlass.range(1, ntiles):
             cute.arch.barrier()  # the refill overwrites what the previous fold just read
             for i in cutlass.range_constexpr(rpb):
@@ -1396,16 +1481,26 @@ class TileReduce:
                         )
                         dst = Int32(const_expr(i * pitch // grp + u * WARP)) + lane
                         for f in cutlass.range_constexpr(nf):
-                            cute.copy(g2s[f], gv[f][None, src], sv[f][None, dst])
+                            if const_expr(weights and f == 2):
+                                for v in cutlass.range_constexpr(grp):
+                                    j = (Int32(u * WARP) + lane) * Int32(grp) + Int32(v)
+                                    index = t * Int32(tile_n) + j
+                                    count = fdtypes[f](
+                                        const_expr(self.itree.combine_count)
+                                    )
+                                    nn = fdtypes[f](index) * count + count
+                                    sbuf[f][Int32(i * pitch) + j] = count / nn
+                            else:
+                                cute.copy(g2s[f], gv[f][None, src], sv[f][None, dst])
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
             if const_expr(unroll):
                 for j in cutlass.range(tile_n, unroll=unroll):
-                    acc = combine_fn(acc, take(j))
+                    acc = combine_fn(acc, take(j), t * Int32(tile_n) + j)
             else:
                 for j in cutlass.range_constexpr(tile_n):
-                    acc = combine_fn(acc, take(j))
+                    acc = combine_fn(acc, take(j), t * Int32(tile_n) + Int32(j))
         return acc
 
     @cute.jit
@@ -1830,7 +1925,16 @@ class TileReduce:
                 ),
             )
         else:
-            if const_expr(self.load_ahead == 4):
+            if const_expr(self.row_accumulators):
+                acc = fold_row_static(
+                    trait,
+                    mIns[0],
+                    unit,
+                    self.tm,
+                    lane,
+                    const_expr(self.row_accumulators),
+                )
+            elif const_expr(self.load_ahead == 4):
                 acc = fold_row_prefetched4(
                     trait,
                     mIns[0],

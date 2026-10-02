@@ -263,6 +263,62 @@ class TestReductionConfig(TestCase):
         self.assertEqual(rt._ITREE_ARCH[(10, 7)], rt._ITREE_ARCH["default"])
         self.assertNotEqual(rt._ITREE_ARCH[(10, 7)], rt._ITREE_ARCH[(10, 0)])
 
+    @parametrize(
+        "dtype,width,mib,key,fields,nouts,expected",
+        [
+            (torch.float32, 256, 16, "mean", 1, 1, "linear"),
+            (torch.float32, 256, 64, "mean", 1, 1, "inner_tree"),
+            (torch.bfloat16, 256, 16, "sum", 1, 1, "inner_tree"),
+            (torch.bfloat16, 256, 64, "sum", 1, 1, "linear"),
+            (torch.float32, 4096, 16, "varmean0", 3, 2, "inner_tree"),
+            (torch.float32, 4096, 256, "sum", 1, 1, "inner_tree"),
+            (torch.bfloat16, 4096, 256, "sum", 1, 1, "linear"),
+            (torch.bfloat16, 4096, 2048, "argmaxi32", 2, 1, "inner_tree"),
+        ],
+    )
+    def test_unordered_row_selection(
+        self, dtype, width, mib, key, fields, nouts, expected
+    ):
+        rows = (mib << 20) // (width * dtype.itemsize)
+        args = ((10, 7), dtype, key, width, rows)
+        kwargs = dict(nfields=fields, nouts=nouts)
+        self.assertEqual(
+            rt.select_row_order(*args, order="unordered", **kwargs), expected
+        )
+        self.assertEqual(
+            rt.select_row_order(*args, order="inner_tree", **kwargs), "inner_tree"
+        )
+
+    @parametrize(
+        "updates",
+        [
+            {"cc": (8, 0)},
+            {"cc": (9, 0)},
+            {"cc": (10, 0)},
+            {"cc": (11, 0)},
+            {"N": 4095},
+            {"N": 4097},
+            {"M": 16383},
+            {"M": 16385},
+            {"nfields": 2},
+            {"nouts": 2},
+            {"alignment": 8},
+        ],
+    )
+    def test_unordered_row_selection_guards(self, updates):
+        args = dict(
+            cc=(10, 7),
+            dtype=torch.float32,
+            trait_key="var0",
+            N=4096,
+            M=16384,
+            order="unordered",
+            nfields=3,
+            nouts=1,
+        )
+        args.update(updates)
+        self.assertEqual(rt.select_row_order(**args), "linear")
+
 
 @unittest.skipUnless(TEST_CUDA and SM90OrLater, "CuTeDSL requires Hopper or later")
 class TestReductionConfigDevice(TestCase):

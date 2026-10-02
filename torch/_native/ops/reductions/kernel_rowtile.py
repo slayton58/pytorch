@@ -132,6 +132,8 @@ class _ItreeArch(NamedTuple):
     combine_unroll: int = (
         0  # staged fold unroll factor; 0 retains full static unrolling
     )
+    uniform_count: bool = False
+    combine_weights: bool = False
 
 
 # Performance tuning is keyed by full compute capability. Each measured GPU has
@@ -221,7 +223,18 @@ def select_full_itree_arch(
     else:
         return None
     # Measured full-reduction anchors; keep columns and other sizes on their arch profile.
-    return _ItreeArch(4, WARP, 16, False, 32, 2048, unroll)
+    welford = field_bits == (32, 32, 32)
+    return _ItreeArch(
+        4,
+        WARP,
+        16,
+        False,
+        32,
+        2048,
+        unroll,
+        uniform_count=welford,
+        combine_weights=welford,
+    )
 
 
 def _full_itree_arch(
@@ -298,18 +311,39 @@ def select_row_order(
     if (
         cc != (10, 7)
         or dtype not in (torch.float32, torch.bfloat16)
-        or N != 1024
+        or N not in (256, 1024, 4096)
         or acc_bits != 32
         or alignment < 16
     ):
         return "linear"
     itemsize = 4 if dtype == torch.float32 else 2
     # Seed measured anchors; intermediate sizes retain their existing policy.
-    if M * N * itemsize not in (16 << 20, 64 << 20, 256 << 20, 2 << 30):
+    size = M * N * itemsize
+    if size not in (16 << 20, 64 << 20, 256 << 20, 2 << 30):
         return "linear"
-    if nfields == 3 and (trait_key, nouts) in (("var0", 1), ("varmean0", 2)):
-        return "inner_tree"
-    if dtype == torch.bfloat16 and (trait_key, nfields, nouts) == ("argmaxi32", 2, 1):
+    welford = nfields == 3 and (trait_key, nouts) in (("var0", 1), ("varmean0", 2))
+    argmax = (trait_key, nfields, nouts) == ("argmaxi32", 2, 1)
+    simple = (
+        nfields == 1 and nouts == 1 and trait_key in ("sum", "mean", "amax", "vnorm2")
+    )
+    if not (simple or argmax or welford):
+        return "linear"
+    if N == 1024:
+        inner = welford or (dtype == torch.bfloat16 and argmax)
+    elif N == 256:
+        if dtype == torch.bfloat16:
+            inner = size == 16 << 20 and not argmax
+        else:
+            inner = size >= 256 << 20 or (
+                not argmax and (trait_key != "mean" or size >= 64 << 20)
+            )
+    else:
+        inner = (
+            welford
+            or argmax
+            or (dtype == torch.float32 and (trait_key == "mean" or size >= 256 << 20))
+        )
+    if inner:
         return "inner_tree"
     return "linear"
 
@@ -345,6 +379,9 @@ class _ItreePlan(NamedTuple):
     # global. Also bit-neutral -- staging moves where the operand is read from, not the chain.
     combine_tile: int = 0
     combine_unroll: int = 0
+    # Nonzero only for equal, nonempty, power-of-two Welford partial counts.
+    combine_count: int = 0
+    combine_weights: bool = False
 
     @property
     def sig(self) -> tuple[Any, ...]:
@@ -364,6 +401,8 @@ class _ItreePlan(NamedTuple):
             self.combine_grp,
             self.combine_tile,
             self.combine_unroll,
+            self.combine_count,
+            self.combine_weights,
         )
 
 
@@ -596,9 +635,15 @@ def itree_combine_plan(
     nrows: int | None = None,
     *,
     arch: _ItreeArch | None = None,
+    uniform_count: bool | None = None,
+    combine_weights: bool | None = None,
 ) -> _ItreePlan:
     """Plan the architecture-tuned, bit-neutral fold of each row's split partials."""
     arch = _itree_arch(device) if arch is None else arch
+    if uniform_count is None:
+        uniform_count = arch.uniform_count
+    if combine_weights is None:
+        combine_weights = arch.combine_weights
     if arch.combine_unroll < 0:
         raise ValueError("combine_unroll must be nonnegative")
     caps = _hw.caps(device)
@@ -627,6 +672,18 @@ def itree_combine_plan(
         ),
         0,
     )
+    count = (
+        itree.split[1]
+        if uniform_count
+        and tile_n
+        and itemsize == 4
+        and nfields == 3
+        and 0 < nbatch <= 2**24
+        and 0 < itree.split[1] <= 2**24
+        and itree.split[1] == itree.split[2]
+        and not (itree.split[1] & (itree.split[1] - 1))
+        else 0
+    )
     return _ItreePlan(
         "combine",
         1,
@@ -639,6 +696,8 @@ def itree_combine_plan(
         combine_grp=g,
         combine_tile=tile_n,
         combine_unroll=min(arch.combine_unroll, tile_n),
+        combine_count=count,
+        combine_weights=bool(count and combine_weights),
     )
 
 
@@ -950,6 +1009,7 @@ def reduce_row_tile(
     unroll: int | None = None,
     use_tma: bool | None = None,
     order: Literal["linear", "inner_tree"] | None = None,
+    row_accumulators: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Reduce 2-D `x` rows, returning outputs or raw field partials when `final=False`."""
     if x.dim() != 2 or not x.is_cuda or x.stride(-1) != 1:
@@ -959,6 +1019,8 @@ def reduce_row_tile(
     # explicit launch shapes on the default order; explicit requests raise below.
     if order not in (None, "linear", "inner_tree"):
         raise ValueError(f"order must be None, 'linear' or 'inner_tree', got {order!r}")
+    if row_accumulators and order != "linear":
+        raise ValueError("static row accumulators require explicit order='linear'")
     itree, arch = None, None
     if (order == "inner_tree" or (order is None and inner_tree_order_enabled())) and (
         final and threads_per_row is None
@@ -1043,6 +1105,7 @@ def reduce_row_tile(
         final=final,
         unroll=unroll,
         use_tma=use_tma,
+        row_accumulators=row_accumulators,
     )
 
     # Final projects nouts; stage 1 stores one raw buffer per field.
